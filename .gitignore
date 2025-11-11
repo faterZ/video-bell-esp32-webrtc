@@ -1,0 +1,29 @@
+# ESP-IDF build outputs
+build/
+*.bin
+*.map
+
+# Dependencies
+managed_components/
+dependencies.lock
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Example projects (optional - uncomment if you don't want to track examples)
+example-camera/**/build/
+example-camera/**/managed_components/
+example-camera/**/*.lock
+example-camera/**/sdkconfig
+example-camera/**/sdkconfig.old
+
+# ESP-IDF specific
+sdkconfig.old
