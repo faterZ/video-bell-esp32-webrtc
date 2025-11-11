@@ -173,7 +173,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.3.1
   espressif/esp_libsrtp:
@@ -297,10 +297,41 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.65.0~1
+  espressif/usb_stream:
+    component_hash: 28afd6278e70943ed5051be4cbadb963f0d026148298d83370afaef58167e157
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.5.*
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    version: 1.4.0
   idf:
     source:
       type: idf
     version: 5.4.2
+  lijunru-hub/esp-ppbuffer:
+    component_hash: d27fa07485f06b8589a0218502f174cedbffc18ef082d4a1f811c8ad0eb22f41
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4.0'
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.1.0
   media_lib_sal:
     dependencies: []
     source:
@@ -321,13 +352,16 @@ direct_dependencies:
 - espressif/esp_capture
 - espressif/esp_codec_dev
 - espressif/esp_h264
+- espressif/esp_jpeg
 - espressif/esp_libsrtp
 - espressif/esp_video_codec
 - espressif/esp_websocket_client
 - espressif/nghttp
+- espressif/usb_stream
 - idf
+- lijunru-hub/esp-ppbuffer
 - tempotian/av_render
 - tempotian/media_lib_sal
-manifest_hash: b3779cfa5ab9ef0f3357204f8a6e467633c906121764e1a0e8365942cd385fea
+manifest_hash: 8ddc5b2dc81451f55e0d8ca2baf8b792b3016ddccc0366d20ea85483f3acb076
 target: esp32s3
 version: 2.0.0

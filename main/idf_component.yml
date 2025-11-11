@@ -8,3 +8,16 @@ dependencies:
     version: "1.0.4"
     rules:
     - if: target in [esp32p4, esp32s3]
+  ## USB camera support for ESP32-S3 (using exact versions from working example)
+  espressif/usb_stream:
+    version: "1.4.0"
+    rules:
+    - if: target == esp32s3
+  espressif/esp_jpeg:
+    version: "^1.0.5"
+    rules:
+    - if: target == esp32s3
+  lijunru-hub/esp-ppbuffer:
+    version: "^0.1.0"
+    rules:
+    - if: target == esp32s3

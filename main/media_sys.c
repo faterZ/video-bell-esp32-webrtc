@@ -12,6 +12,10 @@
 #if CONFIG_IDF_TARGET_ESP32P4
 #include "esp_video_init.h"
 #endif
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "usb_stream.h"
+#include "jpeg_decoder.h"
+#endif
 #include "av_render.h"
 #include "av_render_default.h"
 #include "common.h"
@@ -56,8 +60,29 @@ static const uint8_t *music_to_play;
 static int            music_size;
 static int            music_duration;
 
+#if CONFIG_IDF_TARGET_ESP32S3
+// USB camera initialization for ESP32-S3
+static esp_capture_video_src_if_t *create_usb_video_source(void)
+{
+    ESP_LOGI(TAG, "Initializing USB camera...");
+    // TODO: Implement USB camera initialization
+    // Will add USB streaming setup in next step
+    return NULL;
+}
+#endif
+
 static esp_capture_video_src_if_t *create_video_source(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Try USB camera first on ESP32-S3
+    esp_capture_video_src_if_t *usb_src = create_usb_video_source();
+    if (usb_src != NULL) {
+        ESP_LOGI(TAG, "Using USB camera as video source");
+        return usb_src;
+    }
+    ESP_LOGI(TAG, "USB camera not available, falling back to DVP camera");
+#endif
+
     camera_cfg_t cam_pin_cfg = {};
     int ret = get_camera_cfg(&cam_pin_cfg);
     if (ret != 0) {
