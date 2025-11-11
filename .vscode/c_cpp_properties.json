@@ -1,0 +1,41 @@
+{
+    "configurations": [
+        {
+            "name": "ESP-IDF",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${env:IDF_PATH}/components/**",
+                "${workspaceFolder}/components/**",
+                "${workspaceFolder}/managed_components/**",
+                // 系统头文件路径（保留你实际存在的路径）
+                "F:/ESP-IDF-5.4/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/xtensa-esp-elf/include/**",
+                // "F:/ESP-IDF-5.4/Espressif/frameworks/esp-idf-v5.4.2/components/**",
+                // 新增：显式添加 ESP-IDF 常用组件路径（解决特定头文件识别）
+                "${env:IDF_PATH}/components/esp_system/include/**",  // 解决系统相关宏
+                "${env:IDF_PATH}/components/esp_wifi/include/**"     // 解决 Wi-Fi 相关函数（如有）
+            ],
+            "defines": [
+                "ESP_PLATFORM",
+                "CONFIG_IDF_TARGET_ESP32S3",
+                "__cplusplus=201703L",
+                // 新增：补充布尔类型定义（解决 true/false 未定义）
+                "true=1",
+                "false=0",
+                // 新增：ESP-IDF 常用宏定义（根据项目实际使用的功能添加）
+                "CONFIG_SNTP_ENABLED=1",  // 若使用 SNTP，添加此宏
+                "CONFIG_FREERTOS_UNICORE=0"  // 多核心配置（按需添加）
+            ],
+            "compilerPath": "F:/ESP-IDF-5.4/Espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc.exe",
+            // "cStandard": "c11",
+            // "cppStandard": "c++17",
+            // "intelliSenseMode": "gcc-arm",
+            // 新增：强制编译器驱动模式，提升语法解析准确性
+            // "compilerArgs": [
+            //     "-mlongcalls",
+            //     "-ffunction-sections",
+            //     "-fdata-sections"
+            // ]
+        }
+    ],
+    "version": 4
+}

@@ -1,0 +1,9 @@
+# 编译产物
+build/
+dist/
+# 临时文件
+*.log
+*.swp
+# VS Code 配置（若不想上传）
+# ESP-IDF 生成文件
+sdkconfig.old
