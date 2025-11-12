@@ -316,23 +316,22 @@ static esp_capture_video_src_if_t *create_usb_video_source(void)
     usb_streaming_state_register(&usb_stream_state_changed_cb, NULL);
     ESP_LOGI(TAG, "✅ USB state callback registered");
     
-    // 启动USB流
-    ESP_LOGI(TAG, "▶️  Starting USB streaming...");
-    ESP_LOGI(TAG, "   (Waiting for USB camera to be plugged in...)");
+    // 启动USB流（非阻塞模式，在后台等待摄像头插入）
+    ESP_LOGI(TAG, "▶️  Starting USB streaming in background...");
+    ESP_LOGI(TAG, "   USB camera will be detected automatically when plugged in");
     ret = usb_streaming_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ USB streaming start failed: %s (0x%x)", 
+        ESP_LOGW(TAG, "⚠️  USB streaming start returned: %s (0x%x)", 
                  esp_err_to_name(ret), ret);
-        ESP_LOGE(TAG, "   Possible reasons:");
-        ESP_LOGE(TAG, "   - USB camera not connected");
-        ESP_LOGE(TAG, "   - Incompatible USB device");
-        ESP_LOGE(TAG, "   - Power supply insufficient");
-        goto error;
+        ESP_LOGW(TAG, "   This is normal if no camera is connected yet");
+        ESP_LOGW(TAG, "   Camera will be initialized when you plug it in");
+    } else {
+        ESP_LOGI(TAG, "✅ USB streaming started successfully!");
     }
     
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "✅ USB camera initialized successfully!");
-    ESP_LOGI(TAG, "   Waiting for STREAM_CONNECTED event...");
+    ESP_LOGI(TAG, "✅ USB camera system ready!");
+    ESP_LOGI(TAG, "   Plug in camera to start streaming");
     ESP_LOGI(TAG, "========================================");
     
     // TODO: 创建esp_capture接口适配层

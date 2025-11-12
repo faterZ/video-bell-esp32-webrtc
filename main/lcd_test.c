@@ -19,8 +19,10 @@ void lcd_test_init(void)
 {
     ESP_LOGI(TAG, "Initializing LCD test...");
     
-    // 初始化IIC总线和XL9555 (控制LCD背光的IO扩展器)
+    // 初始化IIC总线（如果已被codec初始化，会自动跳过）
     myiic_init();
+    
+    // 初始化XL9555 (控制LCD背光的IO扩展器)
     xl9555_init();
     
     // 初始化LCD显示屏

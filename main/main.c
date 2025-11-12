@@ -11,6 +11,7 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_random.h>
 #include <nvs_flash.h>
 #include <sys/param.h>
 #include "argtable3/argtable3.h"
@@ -55,7 +56,7 @@ static char room_url[128];
     }                                   \
     media_lib_thread_create_from_scheduler(NULL, #name, run_async##name, NULL);
 
-// WebRTC信令服务器地址，默认使用Espressif官方服务器
+// WebRTC信令服务器地址，默认使用官方服务器
 char server_url[64] = "https://webrtc.espressif.com";
 
 /**
@@ -201,7 +202,38 @@ static int gimbal_cli(int argc, char **argv)
         servo_set_angle(LEDC_CHANNEL_1, angle);
         ESP_LOGI(TAG, "Set PITCH to %.1f°", angle);
     } else {
-        ESP_LOGI(TAG, "Unknown command");
+        ESP_LOGI(TAG, "Unknown gimbal command");
+        return -1;
+    }
+    return 0;
+}
+
+static int test_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        ESP_LOGI(TAG, "Usage: test [lcd|mic|speaker|all]");
+        return -1;
+    }
+    
+    if (strcmp(argv[1], "lcd") == 0) {
+        ESP_LOGI(TAG, "🖥️  Testing LCD...");
+        lcd_test_run();
+    } else if (strcmp(argv[1], "mic") == 0) {
+        ESP_LOGI(TAG, "🎤 Testing microphone (recording 3 seconds)...");
+        ESP_LOGI(TAG, "Please speak now!");
+        // TODO: 麦克风测试需要实现录音逻辑
+        ESP_LOGW(TAG, "Microphone test not yet implemented");
+    } else if (strcmp(argv[1], "speaker") == 0) {
+        ESP_LOGI(TAG, "🔊 Testing speaker...");
+        // TODO: 喇叭测试需要实现播放逻辑
+        ESP_LOGW(TAG, "Speaker test not yet implemented");
+    } else if (strcmp(argv[1], "all") == 0) {
+        ESP_LOGI(TAG, "🧪 Running all hardware tests...");
+        lcd_test_run();
+        media_lib_thread_sleep(2000);
+        ESP_LOGW(TAG, "Audio tests not yet implemented");
+    } else {
+        ESP_LOGI(TAG, "Unknown test: %s", argv[1]);
         return -1;
     }
     return 0;
@@ -286,6 +318,11 @@ static int init_console()
             .help = "Gimbal control: gimbal [scan|reset|yaw <angle>|pitch <angle>]\r\n",
             .func = gimbal_cli,
         },
+        {
+            .command = "test",
+            .help = "Hardware test: test [lcd|mic|speaker|all]\r\n",
+            .func = test_cli,
+        },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -367,10 +404,13 @@ static void capture_scheduler(const char *name, esp_capture_thread_schedule_cfg_
  */
 static char* gen_room_id_use_mac(void)
 {
-    static char room_mac[16];
+    static char room_mac[24];
     uint8_t mac[6];
     network_get_mac(mac);
-    snprintf(room_mac, sizeof(room_mac)-1, "esp_%02x%02x%02x", mac[3], mac[4], mac[5]);
+    // 添加随机数避免房间冲突
+    uint16_t random = esp_random() & 0xFFFF;
+    snprintf(room_mac, sizeof(room_mac)-1, "esp_%02x%02x%02x_%04x", 
+             mac[3], mac[4], mac[5], random);
     return room_mac;
 }
 
@@ -408,6 +448,11 @@ static int network_event_handler(bool connected)
  */
 void app_main(void)
 {
+    // 早期日志：验证是否进入app_main
+    printf("\n\n========================================\n");
+    printf("🚀 ENTERING APP_MAIN\n");
+    printf("========================================\n\n");
+    
     // 设置全局日志输出级别为ESP_LOG_INFO：高于INFO级别的日志（如DEBUG）不输出
     // 可减少冗余日志，只保留关键运行信息
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -426,38 +471,37 @@ void app_main(void)
 
     // 初始化硬件板卡：包括摄像头、按键、音频 codec、LCD等外设的初始化
     // 具体初始化逻辑在init_board()函数中实现（如引脚配置、设备上电等）
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "📟 Initializing board...");
+    ESP_LOGI(TAG, "========================================");
     init_board();
+    ESP_LOGI(TAG, "✅ Board initialized");
 
 #ifdef CONFIG_IDF_TARGET_ESP32S3
-    // ESP32-S3: 初始化并测试 LCD 屏幕
-    ESP_LOGI(TAG, "Initializing LCD test for ESP32-S3 Box...");
-    lcd_test_init();
-    lcd_test_run();
-    ESP_LOGI(TAG, "LCD test completed");
+    // ESP32-S3: 初始化 LCD（暂时禁用，因为与codec_init的I2C冲突）
+    // TODO: 需要统一I2C管理，让LCD复用codec_init的I2C总线
+    ESP_LOGW(TAG, "⚠️  LCD initialization skipped (I2C conflict with codec_init)");
+    // lcd_test_init();
+    // ESP_LOGI(TAG, "✅ LCD initialized (use 'test lcd' to test)");
 #endif
 
-    // 构建媒体系统：初始化音视频采集链路（摄像头→编码）和播放链路（解码→扬声器）
-    // 建立从硬件到WebRTC模块的媒体数据传输通道
-    media_sys_buildup();
+    // 构建媒体系统：暂时禁用USB摄像头，避免USB枚举冲突
+    // TODO: 等摄像头到货后再启用
+    ESP_LOGW(TAG, "⚠️  Media system initialization skipped (waiting for USB camera)");
+    // ESP_LOGI(TAG, "🎬 Building media system...");
+    // media_sys_buildup();
+    // ESP_LOGI(TAG, "✅ Media system ready");
 
-    // 初始化舵机云台系统
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "🎬 Initializing servo gimbal system...");
-    ESP_LOGI(TAG, "========================================");
+    // 初始化舵机云台系统（不立即扫描，通过命令手动测试）
+    ESP_LOGI(TAG, "🎮 Initializing servo gimbal...");
     if (servo_init() == ESP_OK) {
-        ESP_LOGI(TAG, "✅ Servo gimbal initialized");
-        
-        // 测试云台扫描
-        ESP_LOGI(TAG, "🧪 Running gimbal scan test...");
-        servo_test_scan();
+        ESP_LOGI(TAG, "✅ Servo gimbal initialized (use 'gimbal scan' to test)");
     } else {
-        ESP_LOGE(TAG, "❌ Failed to initialize servo gimbal");
+        ESP_LOGW(TAG, "⚠️  Servo gimbal init skipped (no hardware)");
     }
 
-    // 初始化运动追踪器
-    ESP_LOGI(TAG, "========================================");
+    // 初始化运动追踪器（不立即启动，通过命令手动启动）
     ESP_LOGI(TAG, "🎯 Initializing motion tracker...");
-    ESP_LOGI(TAG, "========================================");
     tracker_config_t tracker_cfg = {
         .frame_width = 640,          // USB摄像头默认分辨率（根据实际调整）
         .frame_height = 480,
@@ -468,14 +512,15 @@ void app_main(void)
         .max_speed = DEFAULT_MAX_SPEED,
     };
     if (motion_tracker_init(&tracker_cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "✅ Motion tracker initialized");
-        
-        // 启动追踪器
-        motion_tracker_start();
-        ESP_LOGI(TAG, "▶️  Motion tracker started");
+        ESP_LOGI(TAG, "✅ Motion tracker initialized (use 'tracker start' to enable)");
     } else {
-        ESP_LOGE(TAG, "❌ Failed to initialize motion tracker");
+        ESP_LOGW(TAG, "⚠️  Motion tracker init skipped");
     }
+    ESP_LOGI(TAG, "========================================");
+
+    // 自动硬件测试（通过WebRTC验证）
+    ESP_LOGI(TAG, "🧪 Hardware ready for WebRTC testing");
+    ESP_LOGI(TAG, "   Use browser to test microphone and speaker");
     ESP_LOGI(TAG, "========================================");
 
     // 初始化命令行控制台：注册"join"、"wifi"等交互命令，启动串口控制台服务
@@ -487,12 +532,16 @@ void app_main(void)
     network_init(WIFI_SSID, WIFI_PASSWORD, network_event_handler);
 
     // 主循环：定期查询WebRTC状态，保持程序运行
+    // 注意：控制台在独立的REPL任务中运行，不会被这个循环阻塞
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "✅ System ready! Type 'help' for commands");
+    ESP_LOGI(TAG, "========================================");
+    
     while (1) {
-        // 休眠2000毫秒（2秒）：降低CPU占用，避免空循环消耗过多资源
-        media_lib_thread_sleep(2000);
+        // 休眠5秒：降低CPU占用，给控制台更多响应时间
+        media_lib_thread_sleep(5000);
 
-        // 查询WebRTC当前状态（如连接状态、媒体流传输情况等）
-        // 可在该函数中添加状态检测或异常处理逻辑
+        // 查询WebRTC当前状态（静默模式，减少日志输出）
         query_webrtc();
     }
 }

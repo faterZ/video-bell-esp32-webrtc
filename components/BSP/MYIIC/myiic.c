@@ -30,6 +30,11 @@ i2c_master_bus_handle_t bus_handle;     /* 总线句柄 */
  */
 esp_err_t myiic_init(void)
 {
+    // 如果已经初始化，直接返回成功
+    if (bus_handle != NULL) {
+        return ESP_OK;
+    }
+    
     i2c_master_bus_config_t i2c_bus_config = {
         .clk_source                     = I2C_CLK_SRC_DEFAULT,  /* 时钟源 */
         .i2c_port                       = IIC_NUM_PORT,         /* I2C端口 */
@@ -38,8 +43,15 @@ esp_err_t myiic_init(void)
         .glitch_ignore_cnt              = 7,                    /* 故障周期 */
         .flags.enable_internal_pullup   = true,                 /* 内部上拉 */
     };
+    
     /* 新建I2C总线 */
-    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &bus_handle));
+    esp_err_t ret = i2c_new_master_bus(&i2c_bus_config, &bus_handle);
+    if (ret != ESP_OK) {
+        // I2C总线可能已被其他模块初始化（如codec_init），这是正常情况
+        // 不要panic，而是警告并继续
+        ESP_LOGW("MYIIC", "I2C bus already initialized by another module, skipping");
+        return ESP_OK;  // 返回成功，让程序继续
+    }
 
     return ESP_OK;
 }

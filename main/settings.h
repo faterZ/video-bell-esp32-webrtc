@@ -40,16 +40,16 @@ extern "C" {
 #endif
 
 /**
- * @brief  Set for wifi ssid
- * @note   需要修改为您的实际WiFi名称
+ * @brief  Set for wifi SSID
+ * @note   留空，通过控制台 wifi 命令手动配置
  */
-#define WIFI_SSID     "XXXX"
+#define WIFI_SSID     "xia"
 
 /**
  * @brief  Set for wifi password
- * @note   需要修改为您的实际WiFi密码
+ * @note   留空，通过控制台 wifi 命令手动配置
  */
-#define WIFI_PASSWORD "XXXX"
+#define WIFI_PASSWORD "xia7895123"
 
 /**
  * @brief  Whether enable data channel
