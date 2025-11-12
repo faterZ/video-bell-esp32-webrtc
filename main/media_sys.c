@@ -136,18 +136,21 @@ static void adaptive_jpg_frame_buffer(size_t length)
  */
 static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
 {
+    static int frame_count = 0;
+    static int64_t last_print_time = 0;
+    
     // 检测分辨率变化
     if (current_width != frame->width || current_height != frame->height) {
         current_width = frame->width;
         current_height = frame->height;
-        ESP_LOGI(TAG, "Resolution changed: %dx%d", current_width, current_height);
+        ESP_LOGI(TAG, "📐 Resolution changed: %dx%d", current_width, current_height);
         adaptive_jpg_frame_buffer(current_width * current_height * 2);
     }
     
     static void *jpeg_buffer = NULL;
     // 获取可写缓冲区
     if (ppbuffer_get_write_buf(ppbuffer_handle, &jpeg_buffer) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to get write buffer");
+        ESP_LOGW(TAG, "⚠️  Failed to get write buffer (buffer full?)");
         return;
     }
     
@@ -157,6 +160,18 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     if (esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer) == ESP_OK) {
         // 通知缓冲区写完成
         ppbuffer_set_write_done(ppbuffer_handle);
+        
+        // 统计帧率（每秒打印一次）
+        frame_count++;
+        int64_t now = esp_timer_get_time();
+        if (now - last_print_time > 1000000) {  // 1秒
+            ESP_LOGI(TAG, "📹 Receiving frames: %d fps, JPEG size: %d bytes", 
+                     frame_count, frame->data_bytes);
+            frame_count = 0;
+            last_print_time = now;
+        }
+    } else {
+        ESP_LOGE(TAG, "❌ JPEG decode failed for frame size %d", frame->data_bytes);
     }
     
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -169,31 +184,53 @@ static void usb_stream_state_changed_cb(usb_stream_state_t event, void *arg)
 {
     switch(event) {
         case STREAM_CONNECTED:
-            ESP_LOGI(TAG, "USB camera connected");
+            ESP_LOGI(TAG, "========================================");
+            ESP_LOGI(TAG, "✅ USB CAMERA CONNECTED!");
+            ESP_LOGI(TAG, "========================================");
+            
             // 获取支持的分辨率列表
             size_t frame_list_num = 0;
             uvc_frame_size_list_get(NULL, &frame_list_num, NULL);
             
             if (frame_list_num > 0) {
-                ESP_LOGI(TAG, "UVC: get frame list size = %u", frame_list_num);
+                ESP_LOGI(TAG, "📋 UVC: Found %u supported resolutions:", frame_list_num);
                 uvc_frame_size_t *frame_list = (uvc_frame_size_t *)malloc(frame_list_num * sizeof(uvc_frame_size_t));
                 if (frame_list) {
                     uvc_frame_size_list_get(frame_list, NULL, NULL);
                     // 打印支持的分辨率
+                    bool found_720p = false;
                     for (size_t i = 0; i < frame_list_num; i++) {
-                        ESP_LOGI(TAG, "  Support resolution: %dx%d", 
+                        ESP_LOGI(TAG, "  [%d] %dx%d", i,
                                 frame_list[i].width, frame_list[i].height);
+                        if (frame_list[i].width == 1280 && frame_list[i].height == 720) {
+                            ESP_LOGI(TAG, "     ✅ 720p SUPPORTED");
+                            found_720p = true;
+                        }
+                    }
+                    if (!found_720p) {
+                        ESP_LOGW(TAG, "⚠️  720p not found in supported list, may use default resolution");
                     }
                     free(frame_list);
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate memory for resolution list");
                 }
+            } else {
+                ESP_LOGW(TAG, "No resolution list available");
             }
+            
+            ESP_LOGI(TAG, "💾 Memory status:");
+            ESP_LOGI(TAG, "  Heap free: %lu bytes", (unsigned long)esp_get_free_heap_size());
+            ESP_LOGI(TAG, "  PSRAM free: %lu bytes", (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             break;
             
         case STREAM_DISCONNECTED:
-            ESP_LOGW(TAG, "USB camera disconnected");
+            ESP_LOGW(TAG, "========================================");
+            ESP_LOGW(TAG, "⚠️  USB CAMERA DISCONNECTED!");
+            ESP_LOGW(TAG, "========================================");
             break;
             
         default:
+            ESP_LOGD(TAG, "USB stream state: %d", event);
             break;
     }
 }
@@ -207,26 +244,37 @@ static void usb_stream_state_changed_cb(usb_stream_state_t event, void *arg)
  */
 static esp_capture_video_src_if_t *create_usb_video_source(void)
 {
-    ESP_LOGI(TAG, "Initializing USB camera...");
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "🚀 Initializing USB camera...");
+    ESP_LOGI(TAG, "========================================");
     
     // 分配USB传输缓冲区
+    ESP_LOGI(TAG, "📦 Allocating USB buffers (%d KB each)...", DEMO_UVC_XFER_BUFFER_SIZE / 1024);
     xfer_buffer_a = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     xfer_buffer_b = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     frame_buffer = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     
     if (!xfer_buffer_a || !xfer_buffer_b || !frame_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate USB buffers");
+        ESP_LOGE(TAG, "❌ Failed to allocate USB buffers");
+        ESP_LOGE(TAG, "   xfer_a: %s, xfer_b: %s, frame: %s",
+                 xfer_buffer_a ? "OK" : "FAIL",
+                 xfer_buffer_b ? "OK" : "FAIL",
+                 frame_buffer ? "OK" : "FAIL");
         goto error;
     }
+    ESP_LOGI(TAG, "✅ USB buffers allocated");
     
     // 创建PingPong缓冲区句柄
+    ESP_LOGI(TAG, "📦 Creating PingPong buffer...");
     ppbuffer_handle = (PingPongBuffer_t *)malloc(sizeof(PingPongBuffer_t));
     if (!ppbuffer_handle) {
-        ESP_LOGE(TAG, "Failed to create ppbuffer handle");
+        ESP_LOGE(TAG, "❌ Failed to create ppbuffer handle");
         goto error;
     }
+    ESP_LOGI(TAG, "✅ PingPong buffer handle created");
     
     // 配置UVC流
+    ESP_LOGI(TAG, "⚙️  Configuring UVC stream (1280x720 @ 15fps)...");
     uvc_config_t uvc_config = {
         .frame_interval = FRAME_INTERVAL_FPS_15,  // 15fps
         .xfer_buffer_size = DEMO_UVC_XFER_BUFFER_SIZE,
@@ -243,27 +291,44 @@ static esp_capture_video_src_if_t *create_usb_video_source(void)
     
     esp_err_t ret = uvc_streaming_config(&uvc_config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "UVC streaming config failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "❌ UVC streaming config failed: %s (0x%x)", 
+                 esp_err_to_name(ret), ret);
         goto error;
     }
+    ESP_LOGI(TAG, "✅ UVC streaming configured");
     
     // 注册USB流状态回调
+    ESP_LOGI(TAG, "🔔 Registering USB state callback...");
     usb_streaming_state_register(&usb_stream_state_changed_cb, NULL);
+    ESP_LOGI(TAG, "✅ USB state callback registered");
     
     // 启动USB流
+    ESP_LOGI(TAG, "▶️  Starting USB streaming...");
+    ESP_LOGI(TAG, "   (Waiting for USB camera to be plugged in...)");
     ret = usb_streaming_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "USB streaming start failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "❌ USB streaming start failed: %s (0x%x)", 
+                 esp_err_to_name(ret), ret);
+        ESP_LOGE(TAG, "   Possible reasons:");
+        ESP_LOGE(TAG, "   - USB camera not connected");
+        ESP_LOGE(TAG, "   - Incompatible USB device");
+        ESP_LOGE(TAG, "   - Power supply insufficient");
         goto error;
     }
     
-    ESP_LOGI(TAG, "USB camera initialized successfully");
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "✅ USB camera initialized successfully!");
+    ESP_LOGI(TAG, "   Waiting for STREAM_CONNECTED event...");
+    ESP_LOGI(TAG, "========================================");
     
     // TODO: 创建esp_capture接口适配层
     // 目前返回NULL，后续对接
     return NULL;
     
 error:
+    ESP_LOGE(TAG, "========================================");
+    ESP_LOGE(TAG, "❌ USB camera initialization FAILED");
+    ESP_LOGE(TAG, "========================================");
     if (xfer_buffer_a) free(xfer_buffer_a);
     if (xfer_buffer_b) free(xfer_buffer_b);
     if (frame_buffer) free(frame_buffer);
