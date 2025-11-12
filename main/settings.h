@@ -17,33 +17,37 @@ extern "C" {
 
 /**
  * @brief  Board name setting refer to `codec_board` README.md for more details
+ * @note   使用ESP32S3_BOX，该板型使用USB摄像头，不支持DVP摄像头
  */
 #if CONFIG_IDF_TARGET_ESP32P4
 #define TEST_BOARD_NAME "ESP32_P4_DEV_V14"
 #else
-#define TEST_BOARD_NAME "S3_Korvo_V2"
+#define TEST_BOARD_NAME "ESP32S3_BOX"  // 修改为ESP32S3_BOX
 #endif
 
 /**
  * @brief  Video resolution settings
+ * @note   ESP32-S3使用USB摄像头，分辨率720p (1280x720)
  */
 #if CONFIG_IDF_TARGET_ESP32P4
 #define VIDEO_WIDTH  1920
 #define VIDEO_HEIGHT 1080
 #define VIDEO_FPS    25
 #else
-#define VIDEO_WIDTH  320
-#define VIDEO_HEIGHT 240
-#define VIDEO_FPS    10
+#define VIDEO_WIDTH  1280
+#define VIDEO_HEIGHT 720
+#define VIDEO_FPS    15
 #endif
 
 /**
  * @brief  Set for wifi ssid
+ * @note   需要修改为您的实际WiFi名称
  */
 #define WIFI_SSID     "XXXX"
 
 /**
  * @brief  Set for wifi password
+ * @note   需要修改为您的实际WiFi密码
  */
 #define WIFI_PASSWORD "XXXX"
 
@@ -65,9 +69,10 @@ extern "C" {
 /**
  * @brief  GPIO for ring button
  *
- * @note  When use ESP32S3-KORVO-V3 Use ADC button as ring button
+ * @note  ESP32S3_BOX使用GPIO0作为BOOT按钮
+ *        可用作门铃按钮触发
  */
-#define DOOR_BELL_RING_BUTTON  5
+#define DOOR_BELL_RING_BUTTON  0  // ESP32S3_BOX的BOOT按钮
 #endif
 
 #ifdef __cplusplus
