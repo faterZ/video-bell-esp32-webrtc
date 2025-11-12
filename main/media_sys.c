@@ -33,6 +33,8 @@
 #include "decoder/esp_audio_dec_default.h"
 #include "esp_capture_defaults.h"
 #include "esp_capture_sink.h"
+#include "servo_control.h"
+#include "motion_tracker.h"
 
 #define TAG "MEDIA_SYS"
 
@@ -160,6 +162,18 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     if (esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer) == ESP_OK) {
         // 通知缓冲区写完成
         ppbuffer_set_write_done(ppbuffer_handle);
+        
+        // 【运动追踪】处理解码后的帧
+        if (motion_tracker_is_running()) {
+            motion_target_t target = {0};
+            // 处理解码后的RGB888图像
+            if (motion_tracker_process_frame(jpeg_buffer, current_width, current_height, 3, &target) == ESP_OK) {
+                // 如果检测到运动，更新云台位置
+                if (target.detected) {
+                    motion_tracker_update_gimbal(&target);
+                }
+            }
+        }
         
         // 统计帧率（每秒打印一次）
         frame_count++;

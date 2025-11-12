@@ -25,6 +25,8 @@
 #include "common.h"
 #include "esp_capture.h"
 #include "lcd_test.h"
+#include "servo_control.h"
+#include "motion_tracker.h"
 
 static const char *TAG = "Webrtc_Test";
 
@@ -155,6 +157,56 @@ static int measure_cli(int argc, char **argv)
     return 0;
 }
 
+static int tracker_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        ESP_LOGI(TAG, "Usage: tracker [start|stop|reset]");
+        return -1;
+    }
+    
+    if (strcmp(argv[1], "start") == 0) {
+        motion_tracker_start();
+        ESP_LOGI(TAG, "▶️  Motion tracker started");
+    } else if (strcmp(argv[1], "stop") == 0) {
+        motion_tracker_stop();
+        ESP_LOGI(TAG, "⏸️  Motion tracker stopped");
+    } else if (strcmp(argv[1], "reset") == 0) {
+        motion_tracker_reset();
+        ESP_LOGI(TAG, "🔄 Motion tracker reset");
+    } else {
+        ESP_LOGI(TAG, "Unknown command: %s", argv[1]);
+        return -1;
+    }
+    return 0;
+}
+
+static int gimbal_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        ESP_LOGI(TAG, "Usage: gimbal [scan|reset|yaw <angle>|pitch <angle>]");
+        return -1;
+    }
+    
+    if (strcmp(argv[1], "scan") == 0) {
+        servo_test_scan();
+    } else if (strcmp(argv[1], "reset") == 0) {
+        servo_reset_gimbal();
+        ESP_LOGI(TAG, "🔄 Gimbal reset to center");
+    } else if (strcmp(argv[1], "yaw") == 0 && argc >= 3) {
+        float angle = atof(argv[2]);
+        servo_set_angle(LEDC_CHANNEL_0, angle);
+        ESP_LOGI(TAG, "Set YAW to %.1f°", angle);
+    } else if (strcmp(argv[1], "pitch") == 0 && argc >= 3) {
+        float angle = atof(argv[2]);
+        servo_set_angle(LEDC_CHANNEL_1, angle);
+        ESP_LOGI(TAG, "Set PITCH to %.1f°", angle);
+    } else {
+        ESP_LOGI(TAG, "Unknown command");
+        return -1;
+    }
+    return 0;
+}
+
 static int init_console()
 {
     esp_console_repl_t *repl = NULL;
@@ -219,10 +271,20 @@ static int init_console()
             .help = "measure system loading\r\n",
             .func = measure_cli,
         },
-         {
+        {
             .command = "server",
             .help = "Select server\r\n",
             .func = server_cli,
+        },
+        {
+            .command = "tracker",
+            .help = "Motion tracker control: tracker [start|stop|reset]\r\n",
+            .func = tracker_cli,
+        },
+        {
+            .command = "gimbal",
+            .help = "Gimbal control: gimbal [scan|reset|yaw <angle>|pitch <angle>]\r\n",
+            .func = gimbal_cli,
         },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -377,6 +439,44 @@ void app_main(void)
     // 构建媒体系统：初始化音视频采集链路（摄像头→编码）和播放链路（解码→扬声器）
     // 建立从硬件到WebRTC模块的媒体数据传输通道
     media_sys_buildup();
+
+    // 初始化舵机云台系统
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "🎬 Initializing servo gimbal system...");
+    ESP_LOGI(TAG, "========================================");
+    if (servo_init() == ESP_OK) {
+        ESP_LOGI(TAG, "✅ Servo gimbal initialized");
+        
+        // 测试云台扫描
+        ESP_LOGI(TAG, "🧪 Running gimbal scan test...");
+        servo_test_scan();
+    } else {
+        ESP_LOGE(TAG, "❌ Failed to initialize servo gimbal");
+    }
+
+    // 初始化运动追踪器
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "🎯 Initializing motion tracker...");
+    ESP_LOGI(TAG, "========================================");
+    tracker_config_t tracker_cfg = {
+        .frame_width = 640,          // USB摄像头默认分辨率（根据实际调整）
+        .frame_height = 480,
+        .motion_threshold = DEFAULT_MOTION_THRESHOLD,
+        .pid_kp = DEFAULT_PID_KP,
+        .pid_ki = DEFAULT_PID_KI,
+        .pid_kd = DEFAULT_PID_KD,
+        .max_speed = DEFAULT_MAX_SPEED,
+    };
+    if (motion_tracker_init(&tracker_cfg) == ESP_OK) {
+        ESP_LOGI(TAG, "✅ Motion tracker initialized");
+        
+        // 启动追踪器
+        motion_tracker_start();
+        ESP_LOGI(TAG, "▶️  Motion tracker started");
+    } else {
+        ESP_LOGE(TAG, "❌ Failed to initialize motion tracker");
+    }
+    ESP_LOGI(TAG, "========================================");
 
     // 初始化命令行控制台：注册"join"、"wifi"等交互命令，启动串口控制台服务
     // 用于调试和手动控制设备（如输入指令连接Wi-Fi、加入房间）
