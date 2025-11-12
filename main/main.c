@@ -24,6 +24,7 @@
 #include "settings.h"
 #include "common.h"
 #include "esp_capture.h"
+#include "lcd_test.h"
 
 static const char *TAG = "Webrtc_Test";
 
@@ -297,6 +298,14 @@ void app_main(void)
     // 初始化硬件板卡：包括摄像头、按键、音频 codec、LCD等外设的初始化
     // 具体初始化逻辑在init_board()函数中实现（如引脚配置、设备上电等）
     init_board();
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    // ESP32-S3: 初始化并测试 LCD 屏幕
+    ESP_LOGI(TAG, "Initializing LCD test for ESP32-S3 Box...");
+    lcd_test_init();
+    lcd_test_run();
+    ESP_LOGI(TAG, "LCD test completed");
+#endif
 
     // 构建媒体系统：初始化音视频采集链路（摄像头→编码）和播放链路（解码→扬声器）
     // 建立从硬件到WebRTC模块的媒体数据传输通道

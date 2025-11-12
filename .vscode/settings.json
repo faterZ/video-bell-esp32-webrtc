@@ -11,5 +11,6 @@
     "--query-driver=F:\\ESP-IDF-5.4\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
     "--compile-commands-dir=f:\\code\\esp-webrtc-solution-main\\esp-webrtc-solution-main\\solutions\\doorbell_demo\\build"
   ],
-  "C_Cpp.errorSquiggles": "disabled"
+  "C_Cpp.errorSquiggles": "disabled",
+  "idf.portWin": "COM6"
 }

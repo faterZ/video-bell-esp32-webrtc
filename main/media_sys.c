@@ -23,10 +23,10 @@
 #include "settings.h"
 #include "media_lib_os.h"
 #include "esp_timer.h"
-#include "esp_audio_enc_default.h"
-#include "esp_video_enc_default.h"
-#include "esp_video_dec_default.h"
-#include "esp_audio_dec_default.h"
+#include "encoder/esp_audio_enc_default.h"
+#include "encoder/esp_video_enc_default.h"
+#include "decoder/esp_video_dec_default.h"
+#include "decoder/esp_audio_dec_default.h"
 #include "esp_capture_defaults.h"
 #include "esp_capture_sink.h"
 
@@ -220,6 +220,7 @@ int media_sys_buildup(void)
     esp_audio_enc_register_default();
     esp_video_dec_register_default();
     esp_audio_dec_register_default();
+    
     // Build capture system
     build_capture_system();
     // Build player system
