@@ -61,20 +61,36 @@ static int            music_size;
 static int            music_duration;
 
 #if CONFIG_IDF_TARGET_ESP32S3
-// USB camera initialization for ESP32-S3
+/**
+ * @brief 创建USB摄像头视频源 (ESP32-S3专用)
+ * 
+ * 为ESP32-S3外接USB摄像头创建视频捕获源
+ * 
+ * @return esp_capture_video_src_if_t* 成功返回视频源接口指针，失败返回NULL
+ * @note 当前为空实现，返回NULL会触发DVP摄像头回退机制
+ */
 static esp_capture_video_src_if_t *create_usb_video_source(void)
 {
     ESP_LOGI(TAG, "Initializing USB camera...");
-    // TODO: Implement USB camera initialization
-    // Will add USB streaming setup in next step
+    // TODO: 实现USB摄像头初始化
+    // 将在下一步添加USB流设置
     return NULL;
 }
 #endif
 
+/**
+ * @brief 创建视频捕获源
+ * 
+ * 根据硬件平台选择合适的视频源:
+ * - ESP32-S3: 优先USB摄像头，失败则回退到DVP摄像头
+ * - ESP32-P4: 支持MIPI CSI或DVP摄像头
+ * 
+ * @return esp_capture_video_src_if_t* 成功返回视频源接口指针，失败返回NULL
+ */
 static esp_capture_video_src_if_t *create_video_source(void)
 {
 #if CONFIG_IDF_TARGET_ESP32S3
-    // Try USB camera first on ESP32-S3
+    // ESP32-S3优先尝试USB摄像头
     esp_capture_video_src_if_t *usb_src = create_usb_video_source();
     if (usb_src != NULL) {
         ESP_LOGI(TAG, "Using USB camera as video source");
@@ -155,20 +171,29 @@ static esp_capture_video_src_if_t *create_video_source(void)
     return NULL;
 }
 
+/**
+ * @brief 构建音视频捕获系统
+ * 
+ * 创建并初始化视频源和音频源，将它们整合到捕获系统中
+ * 
+ * @return int 成功返回0，失败返回-1
+ */
 static int build_capture_system(void)
 {
+    // 创建视频源
     capture_sys.vid_src = create_video_source();
     RET_ON_NULL(capture_sys.vid_src, -1);
 
+    // 创建音频源（从codec设备）
     esp_capture_audio_dev_src_cfg_t codec_cfg = {
         .record_handle = get_record_handle(),
     };
     capture_sys.aud_src = esp_capture_new_audio_dev_src(&codec_cfg);
     RET_ON_NULL(capture_sys.aud_src, -1);
 
-    // Create capture system
+    // 创建捕获系统，音视频同步模式
     esp_capture_cfg_t cfg = {
-        .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO,
+        .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO,  // 以音频为同步基准
         .audio_src = capture_sys.aud_src,
         .video_src = capture_sys.vid_src,
     };
@@ -176,8 +201,16 @@ static int build_capture_system(void)
     return 0;
 }
 
+/**
+ * @brief 构建音视频播放系统
+ * 
+ * 创建音频渲染器(I2S)、视频渲染器(LCD)以及AV播放器
+ * 
+ * @return int 成功返回0，失败返回-1
+ */
 static int build_player_system()
 {
+    // 创建I2S音频渲染器
     i2s_render_cfg_t i2s_cfg = {
         .fixed_clock = true,
         .play_handle = get_playback_handle(),
@@ -187,6 +220,8 @@ static int build_player_system()
         ESP_LOGE(TAG, "Fail to create audio render");
         return -1;
     }
+    
+    // 创建LCD视频渲染器
     lcd_render_cfg_t lcd_cfg = {
         .lcd_handle = board_get_lcd_handle(),
     };
@@ -194,15 +229,17 @@ static int build_player_system()
 
     if (player_sys.video_render == NULL) {
         ESP_LOGE(TAG, "Fail to create video render");
-        // Allow not display
+        // 允许没有视频显示
     }
+    
+    // 创建AV播放器，整合音视频渲染器
     av_render_cfg_t render_cfg = {
         .audio_render = player_sys.audio_render,
         .video_render = player_sys.video_render,
         .audio_raw_fifo_size = 4096,
         .audio_render_fifo_size = 6 * 1024,
         .video_raw_fifo_size = 500 * 1024,
-        .allow_drop_data = false,
+        .allow_drop_data = false,  // 不允许丢帧
         //.video_render_fifo_size = 4*1024,
     };
     player_sys.player = av_render_open(&render_cfg);
@@ -213,21 +250,37 @@ static int build_player_system()
     return 0;
 }
 
+/**
+ * @brief 初始化媒体系统
+ * 
+ * 注册默认的音视频编解码器，构建捕获和播放系统
+ * 这是媒体系统的总入口函数
+ * 
+ * @return int 成功返回0，失败返回-1
+ */
 int media_sys_buildup(void)
 {
-    // Register for default audio and video codecs
-    esp_video_enc_register_default();
-    esp_audio_enc_register_default();
-    esp_video_dec_register_default();
-    esp_audio_dec_register_default();
+    // 注册默认的音视频编解码器
+    esp_video_enc_register_default();  // 注册视频编码器
+    esp_audio_enc_register_default();  // 注册音频编码器
+    esp_video_dec_register_default();  // 注册视频解码器
+    esp_audio_dec_register_default();  // 注册音频解码器
     
-    // Build capture system
+    // 构建捕获系统（摄像头+麦克风）
     build_capture_system();
-    // Build player system
+    // 构建播放系统（LCD+扬声器）
     build_player_system();
     return 0;
 }
 
+/**
+ * @brief 获取媒体提供者接口
+ * 
+ * 供WebRTC使用，提供捕获和播放系统的句柄
+ * 
+ * @param provide 输出参数，填充捕获和播放句柄
+ * @return int 成功返回0
+ */
 int media_sys_get_provider(esp_webrtc_media_provider_t *provide)
 {
     provide->capture = capture_sys.capture_handle;

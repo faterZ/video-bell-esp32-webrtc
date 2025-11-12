@@ -28,13 +28,23 @@
 
 static const char *TAG = "Webrtc_Test";
 
+// 房间命令参数结构体：用于解析命令行输入的房间ID
 static struct {
-    struct arg_str *room_id;
-    struct arg_end *end;
+    struct arg_str *room_id;  // 房间ID参数（如 "w123456"）
+    struct arg_end *end;      // 参数列表结束标记
 } room_args;
 
+// 完整房间URL缓存，格式: "https://server/join/room_id"
 static char room_url[128];
 
+/**
+ * @brief 异步任务宏：创建新线程执行指定代码块
+ * @param name 任务名称（用于线程标识）
+ * @param body 要在新线程中执行的代码
+ * 
+ * 用法示例: RUN_ASYNC(leave, { stop_webrtc(); });
+ * 会创建名为 "leave" 的线程执行 stop_webrtc()，执行完自动销毁线程
+ */
 #define RUN_ASYNC(name, body)           \
     void run_async##name(void *arg)     \
     {                                   \
@@ -43,8 +53,22 @@ static char room_url[128];
     }                                   \
     media_lib_thread_create_from_scheduler(NULL, #name, run_async##name, NULL);
 
+// WebRTC信令服务器地址，默认使用Espressif官方服务器
 char server_url[64] = "https://webrtc.espressif.com";
 
+/**
+ * @brief 加入WebRTC房间命令处理函数
+ * @param argc 参数数量
+ * @param argv 参数数组，argv[0]为命令名 "join"，argv[1]为房间ID
+ * @return 0: 成功，1: 参数错误
+ * 
+ * 功能：
+ * 1. 解析房间ID参数
+ * 2. 首次调用时同步SNTP时间（WebRTC需要准确时间戳）
+ * 3. 构造房间URL并启动WebRTC连接
+ * 
+ * 使用示例: join w123456
+ */
 static int join_room(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&room_args);
@@ -52,6 +76,7 @@ static int join_room(int argc, char **argv)
         arg_print_errors(stderr, room_args.end, argv[0]);
         return 1;
     }
+    // SNTP时间同步：WebRTC需要准确时间戳，首次调用时同步
     static bool sntp_synced = false;
     if (sntp_synced == false) {
         if (0 == webrtc_utils_time_sync_init()) {
@@ -65,6 +90,10 @@ static int join_room(int argc, char **argv)
     return 0;
 }
 
+/**
+ * @brief 离开WebRTC房间命令处理函数
+ * 使用异步线程停止WebRTC会话，避免阻塞命令行
+ */
 static int leave_room(int argc, char **argv)
 {
     RUN_ASYNC(leave, { stop_webrtc(); });
@@ -203,10 +232,21 @@ static int init_console()
     return 0;
 }
 
+/**
+ * @brief 线程调度配置回调函数：为不同功能的线程设置优先级、栈大小、CPU核心绑定
+ * @param thread_name 线程名称（由媒体库/WebRTC模块传入）
+ * @param schedule_cfg 调度配置结构体（输入默认值，函数修改后输出）
+ * 
+ * 关键线程配置：
+ * - venc_0: 视频编码线程（优先级10，栈20KB for ESP32-S3）
+ * - aenc_0: 音频编码线程（OPUS需40KB栈，优先级10，绑定核心1）
+ * - AUD_SRC: 音频采集线程（优先级15，保证实时性）
+ * - pc_task: PeerConnection任务（25KB栈，优先级18，核心1）
+ */
 static void thread_scheduler(const char *thread_name, media_lib_thread_cfg_t *schedule_cfg)
 {
     if (strcmp(thread_name, "venc_0") == 0) {
-        // For H264 may need huge stack if use hardware encoder can set it to small value
+        // 视频编码线程：H264硬件编码栈可减小，软件编码需更多栈空间
         schedule_cfg->priority = 10;
 #if CONFIG_IDF_TARGET_ESP32S3
         schedule_cfg->stack_size = 20 * 1024;
@@ -214,24 +254,34 @@ static void thread_scheduler(const char *thread_name, media_lib_thread_cfg_t *sc
     }
 #ifdef WEBRTC_SUPPORT_OPUS
     else if (strcmp(thread_name, "aenc_0") == 0) {
-        // For OPUS encoder it need huge stack, when use G711 can set it to small value
+        // 音频编码线程：OPUS编码器需要大量栈空间，G711可设小值
         schedule_cfg->stack_size = 40 * 1024;
         schedule_cfg->priority = 10;
-        schedule_cfg->core_id = 1;
+        schedule_cfg->core_id = 1;  // 绑定核心1减少干扰
     }
 #endif
     else if (strcmp(thread_name, "AUD_SRC") == 0) {
+        // 音频采集线程：高优先级保证采样实时性
         schedule_cfg->priority = 15;
     } else if (strcmp(thread_name, "pc_task") == 0) {
+        // PeerConnection主任务：处理信令和媒体流控制
         schedule_cfg->stack_size = 25 * 1024;
         schedule_cfg->priority = 18;
         schedule_cfg->core_id = 1;
     }
     if (strcmp(thread_name, "start") == 0) {
+        // WebRTC启动线程：临时任务，栈空间可小
         schedule_cfg->stack_size = 6 * 1024;
     }
 }
 
+/**
+ * @brief 采集模块线程调度适配器：将媒体库调度配置转换为采集模块调度配置
+ * @param name 线程名称
+ * @param schedule_cfg 采集模块的调度配置结构体
+ * 
+ * 作用：统一管理所有线程的调度策略，确保采集线程（如摄像头读取）也遵循调度规则
+ */
 static void capture_scheduler(const char *name, esp_capture_thread_schedule_cfg_t *schedule_cfg)
 {
     media_lib_thread_cfg_t cfg = {
@@ -239,13 +289,20 @@ static void capture_scheduler(const char *name, esp_capture_thread_schedule_cfg_
         .priority = schedule_cfg->priority,
         .core_id = schedule_cfg->core_id,
     };
-    schedule_cfg->stack_in_ext = true;
+    schedule_cfg->stack_in_ext = true;  // 使用外部PSRAM存放栈，节省内部RAM
     thread_scheduler(name, &cfg);
     schedule_cfg->stack_size = cfg.stack_size;
     schedule_cfg->priority = cfg.priority;
     schedule_cfg->core_id = cfg.core_id;
 }
 
+/**
+ * @brief 根据设备MAC地址生成唯一房间ID
+ * @return 房间ID字符串，格式: "esp_XXYYZZ"（后3字节MAC地址）
+ * 
+ * 用途：设备上电后自动使用MAC生成固定房间ID，无需手动输入
+ * 示例：MAC 24:62:AB:12:34:56 → 房间ID "esp_123456"
+ */
 static char* gen_room_id_use_mac(void)
 {
     static char room_mac[16];
@@ -255,10 +312,19 @@ static char* gen_room_id_use_mac(void)
     return room_mac;
 }
 
+/**
+ * @brief 网络事件回调函数：处理Wi-Fi连接成功/断开事件
+ * @param connected true: Wi-Fi已连接，false: Wi-Fi断开
+ * @return 0
+ * 
+ * 功能：
+ * - 连接成功：自动生成房间ID并加入WebRTC房间（门铃自动上线）
+ * - 连接断开：停止WebRTC会话，释放资源
+ */
 static int network_event_handler(bool connected)
 {
     if (connected) {
-        // Enter into Room directly
+        // Wi-Fi连接成功，异步启动WebRTC会话
         RUN_ASYNC(start, {
             char *room = gen_room_id_use_mac();
             snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, room);
@@ -268,6 +334,7 @@ static int network_event_handler(bool connected)
             }
         });
     } else {
+        // Wi-Fi断开，停止WebRTC
         stop_webrtc();
     }
     return 0;
