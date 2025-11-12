@@ -9,12 +9,16 @@
 
 #include "codec_init.h"
 #include "codec_board.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #if CONFIG_IDF_TARGET_ESP32P4
 #include "esp_video_init.h"
 #endif
 #if CONFIG_IDF_TARGET_ESP32S3
 #include "usb_stream.h"
 #include "jpeg_decoder.h"
+#include "ppbuffer.h"
 #endif
 #include "av_render.h"
 #include "av_render_default.h"
@@ -61,19 +65,209 @@ static int            music_size;
 static int            music_duration;
 
 #if CONFIG_IDF_TARGET_ESP32S3
+// USB摄像头相关全局变量
+#define DEMO_UVC_XFER_BUFFER_SIZE (88 * 1024)  // 双缓冲
+static uint8_t *jpg_frame_buf1 = NULL;
+static uint8_t *jpg_frame_buf2 = NULL;
+static uint8_t *xfer_buffer_a = NULL;
+static uint8_t *xfer_buffer_b = NULL;
+static uint8_t *frame_buffer = NULL;
+static PingPongBuffer_t *ppbuffer_handle = NULL;
+static uint16_t current_width = 0;
+static uint16_t current_height = 0;
+static bool if_ppbuffer_init = false;
+
+/**
+ * @brief JPEG解码一张图片
+ */
+static int esp_jpeg_decoder_one_picture(uint8_t *input_buf, size_t len, uint8_t *output_buf)
+{
+    esp_err_t ret = ESP_OK;
+    
+    // JPEG解码配置
+    esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = (uint8_t *)input_buf,
+        .indata_size = len,
+        .outbuf = (uint8_t *)(output_buf),
+        .outbuf_size = current_width * current_height * sizeof(uint16_t),
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = {
+            .swap_color_bytes = 0,
+        }
+    };
+    
+    // JPEG解码
+    esp_jpeg_image_output_t outimg;
+    ret = esp_jpeg_decode(&jpeg_cfg, &outimg);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "JPEG decoded: %dpx x %dpx", outimg.width, outimg.height);
+    }
+    
+    return ret;
+}
+
+/**
+ * @brief 自适应JPG帧缓冲器
+ */
+static void adaptive_jpg_frame_buffer(size_t length)
+{
+    if (jpg_frame_buf1 != NULL) {
+        free(jpg_frame_buf1);
+    }
+    if (jpg_frame_buf2 != NULL) {
+        free(jpg_frame_buf2);
+    }
+    
+    // 申请PSRAM内存
+    jpg_frame_buf1 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    assert(jpg_frame_buf1 != NULL);
+    jpg_frame_buf2 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    assert(jpg_frame_buf2 != NULL);
+    
+    // 创建PingPong缓冲区
+    ESP_ERROR_CHECK(ppbuffer_create(ppbuffer_handle, jpg_frame_buf2, jpg_frame_buf1));
+    if_ppbuffer_init = true;
+    ESP_LOGI(TAG, "PingPong buffer created, size: %zu bytes", length);
+}
+
+/**
+ * @brief USB摄像头帧回调函数
+ */
+static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
+{
+    // 检测分辨率变化
+    if (current_width != frame->width || current_height != frame->height) {
+        current_width = frame->width;
+        current_height = frame->height;
+        ESP_LOGI(TAG, "Resolution changed: %dx%d", current_width, current_height);
+        adaptive_jpg_frame_buffer(current_width * current_height * 2);
+    }
+    
+    static void *jpeg_buffer = NULL;
+    // 获取可写缓冲区
+    if (ppbuffer_get_write_buf(ppbuffer_handle, &jpeg_buffer) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get write buffer");
+        return;
+    }
+    
+    assert(jpeg_buffer != NULL);
+    
+    // JPEG解码
+    if (esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer) == ESP_OK) {
+        // 通知缓冲区写完成
+        ppbuffer_set_write_done(ppbuffer_handle);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+/**
+ * @brief USB数据流状态回调函数
+ */
+static void usb_stream_state_changed_cb(usb_stream_state_t event, void *arg)
+{
+    switch(event) {
+        case STREAM_CONNECTED:
+            ESP_LOGI(TAG, "USB camera connected");
+            // 获取支持的分辨率列表
+            size_t frame_list_num = 0;
+            uvc_frame_size_list_get(NULL, &frame_list_num, NULL);
+            
+            if (frame_list_num > 0) {
+                ESP_LOGI(TAG, "UVC: get frame list size = %u", frame_list_num);
+                uvc_frame_size_t *frame_list = (uvc_frame_size_t *)malloc(frame_list_num * sizeof(uvc_frame_size_t));
+                if (frame_list) {
+                    uvc_frame_size_list_get(frame_list, NULL, NULL);
+                    // 打印支持的分辨率
+                    for (size_t i = 0; i < frame_list_num; i++) {
+                        ESP_LOGI(TAG, "  Support resolution: %dx%d", 
+                                frame_list[i].width, frame_list[i].height);
+                    }
+                    free(frame_list);
+                }
+            }
+            break;
+            
+        case STREAM_DISCONNECTED:
+            ESP_LOGW(TAG, "USB camera disconnected");
+            break;
+            
+        default:
+            break;
+    }
+}
+
 /**
  * @brief 创建USB摄像头视频源 (ESP32-S3专用)
  * 
  * 为ESP32-S3外接USB摄像头创建视频捕获源
  * 
  * @return esp_capture_video_src_if_t* 成功返回视频源接口指针，失败返回NULL
- * @note 当前为空实现，返回NULL会触发DVP摄像头回退机制
  */
 static esp_capture_video_src_if_t *create_usb_video_source(void)
 {
     ESP_LOGI(TAG, "Initializing USB camera...");
-    // TODO: 实现USB摄像头初始化
-    // 将在下一步添加USB流设置
+    
+    // 分配USB传输缓冲区
+    xfer_buffer_a = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    xfer_buffer_b = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    frame_buffer = (uint8_t *)heap_caps_aligned_alloc(16, DEMO_UVC_XFER_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    
+    if (!xfer_buffer_a || !xfer_buffer_b || !frame_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate USB buffers");
+        goto error;
+    }
+    
+    // 创建PingPong缓冲区句柄
+    ppbuffer_handle = (PingPongBuffer_t *)malloc(sizeof(PingPongBuffer_t));
+    if (!ppbuffer_handle) {
+        ESP_LOGE(TAG, "Failed to create ppbuffer handle");
+        goto error;
+    }
+    
+    // 配置UVC流
+    uvc_config_t uvc_config = {
+        .frame_interval = FRAME_INTERVAL_FPS_15,  // 15fps
+        .xfer_buffer_size = DEMO_UVC_XFER_BUFFER_SIZE,
+        .xfer_buffer_a = xfer_buffer_a,
+        .xfer_buffer_b = xfer_buffer_b,
+        .frame_buffer_size = DEMO_UVC_XFER_BUFFER_SIZE,
+        .frame_buffer = frame_buffer,
+        .frame_cb = &camera_frame_cb,
+        .frame_cb_arg = NULL,
+        .frame_width = 1280,   // 从settings.h读取
+        .frame_height = 720,
+        .flags = FLAG_UVC_SUSPEND_AFTER_START,
+    };
+    
+    esp_err_t ret = uvc_streaming_config(&uvc_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UVC streaming config failed: %s", esp_err_to_name(ret));
+        goto error;
+    }
+    
+    // 注册USB流状态回调
+    usb_streaming_state_register(&usb_stream_state_changed_cb, NULL);
+    
+    // 启动USB流
+    ret = usb_streaming_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "USB streaming start failed: %s", esp_err_to_name(ret));
+        goto error;
+    }
+    
+    ESP_LOGI(TAG, "USB camera initialized successfully");
+    
+    // TODO: 创建esp_capture接口适配层
+    // 目前返回NULL，后续对接
+    return NULL;
+    
+error:
+    if (xfer_buffer_a) free(xfer_buffer_a);
+    if (xfer_buffer_b) free(xfer_buffer_b);
+    if (frame_buffer) free(frame_buffer);
+    if (ppbuffer_handle) free(ppbuffer_handle);
     return NULL;
 }
 #endif
