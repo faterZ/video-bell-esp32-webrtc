@@ -130,6 +130,22 @@ static void _media_send(void *ctx)
                 .data = audio_frame.data,
                 .size = audio_frame.size,
             };
+            if (audio_send_frame.size > 0 &&
+                (rtc->aud_send_num < 20 || (rtc->aud_send_num % 200) == 0)) {
+                const uint8_t *payload = (const uint8_t *)audio_send_frame.data;
+                int log_len = audio_send_frame.size < 16 ? audio_send_frame.size : 16;
+                char hex[16 * 3 + 1];
+                int hex_pos = 0;
+                for (int i = 0; i < log_len; ++i) {
+                    hex_pos += sprintf(&hex[hex_pos], "%02X", payload[i]);
+                    if (i + 1 < log_len) {
+                        hex[hex_pos++] = ' ';
+                    }
+                }
+                hex[hex_pos] = '\0';
+                ESP_LOGI(TAG, "[A→WEBRTC] frame #%u size=%u bytes: %s",
+                         (unsigned)rtc->aud_send_num, (unsigned)audio_send_frame.size, hex);
+            }
             esp_peer_send_audio(rtc->pc, &audio_send_frame);
             esp_capture_sink_release_frame(rtc->capture_path, &audio_frame);
             rtc->aud_send_pts = audio_frame.pts;
