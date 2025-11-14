@@ -185,34 +185,32 @@ static int data_set_fmt(const audio_codec_data_if_t *h, esp_codec_dev_type_t dev
     ESP_LOGI(TAG, "Data format request: %" PRIu32 "Hz, %u-bit, %u-ch (type=%d)",
              fs->sample_rate, fs->bits_per_sample, fs->channel, dev_type);
     
-    // 🔥 关键修复:播放和录音共享同一个I2S硬件,必须使用相同采样率!
-    // WebRTC播放需要16kHz,录音需要8kHz,但I2S只能工作在一个频率
-    // 解决方案:统一使用16kHz,让WebRTC的重采样器处理8kHz↔16kHz转换
-    uint32_t actual_rate = 16000;  // 强制使用16kHz
-    
-    if (fs->sample_rate != actual_rate) {
-        ESP_LOGW(TAG, "⚠️  I2S hardware限制:录音/播放共享硬件,统一使用%" PRIu32 " Hz (请求:%" PRIu32 " Hz)",
-                 actual_rate, fs->sample_rate);
-        ESP_LOGW(TAG, "   WebRTC重采样器会自动处理频率转换");
+    uint32_t requested_rate = fs->sample_rate;
+    if (requested_rate == 0) {
+        requested_rate = g_i2s_sample_rate != 0 ? g_i2s_sample_rate : 16000;
+        ESP_LOGW(TAG, "⚠️  Sample rate not specified, defaulting to %" PRIu32 " Hz", requested_rate);
     }
-    
-    // 🔥 只有在采样率或位宽改变时才重新配置I2S
-    // 避免重复调用i2s_set_samplerate_bits_sample()导致I2S停止/重启,造成ESP_ERR_INVALID_STATE错误
-    if (g_i2s_sample_rate != actual_rate || g_i2s_bits_per_sample != fs->bits_per_sample) {
+
+    if (g_i2s_sample_rate != 0 && g_i2s_sample_rate != requested_rate) {
+        ESP_LOGW(TAG, "⚠️  Reconfiguring shared I2S sample rate from %" PRIu32 " Hz to %" PRIu32 " Hz",
+                 g_i2s_sample_rate, requested_rate);
+    }
+
+    // 只有在采样率或位宽改变时才重新配置I2S，避免不必要的停顿
+    if (g_i2s_sample_rate != requested_rate || g_i2s_bits_per_sample != fs->bits_per_sample) {
         ESP_LOGI(TAG, "🔄 Reconfiguring I2S: %" PRIu32 "Hz, %" PRIu32 "-bit -> %" PRIu32 "Hz, %u-bit",
-                 g_i2s_sample_rate, g_i2s_bits_per_sample, actual_rate, fs->bits_per_sample);
-        i2s_set_samplerate_bits_sample(actual_rate, fs->bits_per_sample);
-        g_i2s_sample_rate = actual_rate;
+                 g_i2s_sample_rate, g_i2s_bits_per_sample, requested_rate, fs->bits_per_sample);
+        i2s_set_samplerate_bits_sample(requested_rate, fs->bits_per_sample);
+        g_i2s_sample_rate = requested_rate;
         g_i2s_bits_per_sample = fs->bits_per_sample;
-        ESP_LOGI(TAG, "✅ I2S configured to %" PRIu32 " Hz, %u-bit", 
-                 actual_rate, fs->bits_per_sample);
+        ESP_LOGI(TAG, "✅ I2S configured to %" PRIu32 " Hz, %u-bit",
+                 requested_rate, fs->bits_per_sample);
     } else {
-        ESP_LOGI(TAG, "✅ I2S already at %" PRIu32 " Hz, %u-bit (no reconfiguration needed)", 
-                 actual_rate, fs->bits_per_sample);
+        ESP_LOGI(TAG, "✅ I2S already at %" PRIu32 " Hz, %u-bit (no reconfiguration needed)",
+                 requested_rate, fs->bits_per_sample);
     }
-    
-    // 保存实际配置(注意:保存实际使用的采样率,不是请求的)
-    data_if->sample_rate = actual_rate;
+
+    data_if->sample_rate = requested_rate;
     data_if->bits_per_sample = fs->bits_per_sample;
     
     return ESP_CODEC_DEV_OK;

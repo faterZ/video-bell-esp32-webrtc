@@ -130,6 +130,30 @@ void send_cmd(char *cmd)
     }
 }
 
+bool webrtc_is_active(void)
+{
+    return webrtc != NULL;
+}
+
+void webrtc_trigger_ring(void)
+{
+    if (!webrtc_is_active()) {
+        ESP_LOGW(TAG, "Cannot trigger ring: WebRTC not active");
+        return;
+    }
+    send_cmd("ring");
+}
+
+bool webrtc_is_peer_connected(void)
+{
+    return door_bell_state >= DOOR_BELL_STATE_CONNECTING;
+}
+
+bool webrtc_is_ringing(void)
+{
+    return door_bell_state == DOOR_BELL_STATE_RINGING;
+}
+
 static void key_monitor_thread(void *arg)
 {
     gpio_config_t io_conf;
@@ -184,10 +208,11 @@ int start_webrtc(char *url)
 #ifdef WEBRTC_SUPPORT_OPUS
                 .codec = ESP_PEER_AUDIO_CODEC_OPUS,
                 .sample_rate = 16000,
-                .channel = 2,
 #else
                 .codec = ESP_PEER_AUDIO_CODEC_G711A,
+                .sample_rate = 8000,
 #endif
+                .channel = 1,
             },
             .video_info = {
                 .codec = ESP_PEER_VIDEO_CODEC_H264,

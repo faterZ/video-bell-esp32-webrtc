@@ -35,6 +35,7 @@
 #include "esp_capture_sink.h"
 #include "servo_control.h"
 #include "motion_tracker.h"
+#include "esp_bit_defs.h"
 
 #define TAG "MEDIA_SYS"
 
@@ -452,22 +453,19 @@ static esp_capture_video_src_if_t *create_video_source(void)
  */
 static int build_capture_system(void)
 {
-    // 创建视频源
-    capture_sys.vid_src = create_video_source();
-    RET_ON_NULL(capture_sys.vid_src, -1);
+    // 仅保留音频捕获，避免USB主机占用调试串口
+    capture_sys.vid_src = NULL;
 
-    // 创建音频源（从codec设备）
     esp_capture_audio_dev_src_cfg_t codec_cfg = {
         .record_handle = get_record_handle(),
     };
     capture_sys.aud_src = esp_capture_new_audio_dev_src(&codec_cfg);
     RET_ON_NULL(capture_sys.aud_src, -1);
 
-    // 创建捕获系统，音视频同步模式
     esp_capture_cfg_t cfg = {
-        .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO,  // 以音频为同步基准
+        .sync_mode = ESP_CAPTURE_SYNC_MODE_AUDIO,
         .audio_src = capture_sys.aud_src,
-        .video_src = capture_sys.vid_src,
+        .video_src = NULL,
     };
     esp_capture_open(&cfg, &capture_sys.capture_handle);
     return 0;

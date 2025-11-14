@@ -14,6 +14,7 @@
 #include <esp_random.h>
 #include <nvs_flash.h>
 #include <sys/param.h>
+#include <string.h>
 #include "argtable3/argtable3.h"
 #include "esp_console.h"
 #include "esp_webrtc.h"
@@ -22,14 +23,249 @@
 #include "esp_timer.h"
 #include "webrtc_utils_time.h"
 #include "esp_cpu.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "settings.h"
 #include "common.h"
 #include "esp_capture.h"
 #include "lcd_test.h"
 #include "servo_control.h"
 #include "motion_tracker.h"
+#include "mic_loopback_test.h"
+#include "mic_diagnostic.h"
+#include "codec_init.h"
+#include "esp_codec_dev.h"
+#include "esp_bit_defs.h"
+
+bool webrtc_is_active(void);
+void webrtc_trigger_ring(void);
+bool webrtc_is_peer_connected(void);
+bool webrtc_is_ringing(void);
 
 static const char *TAG = "Webrtc_Test";
+static const char *TAG_MIC = "MicMonitor";
+static bool s_mic_monitor_started = false;
+static esp_codec_dev_handle_t s_mic_monitor_record = NULL;
+static bool s_mic_monitor_record_open = false;
+static bool s_loopback_auto_started = false;
+static bool s_webrtc_auto_started = false;
+static TaskHandle_t s_mic_monitor_task_handle = NULL;
+static volatile bool s_mic_monitor_stop_requested = false;
+static TaskHandle_t s_auto_ring_task_handle = NULL;
+static volatile bool s_auto_ring_stop = false;
+
+#define ENABLE_AUTO_LOOPBACK 0
+#define ENABLE_AUTO_WEBRTC_JOIN 1
+
+#define AUTO_RING_INITIAL_DELAY_MS 30000
+#define AUTO_RING_RETRY_DELAY_MS   15000
+#define AUTO_RING_MAX_ATTEMPTS     5
+
+static void stop_auto_ring_task(void);
+
+static bool mic_monitor_prepare_record(void)
+{
+    if (s_mic_monitor_record == NULL) {
+        s_mic_monitor_record = get_record_handle();
+        if (s_mic_monitor_record == NULL) {
+            ESP_LOGW(TAG_MIC, "Record handle not ready");
+            return false;
+        }
+    }
+
+    if (!s_mic_monitor_record_open) {
+        esp_codec_dev_sample_info_t fs = {
+            .sample_rate = 16000,
+            .channel = 1,
+            .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+            .bits_per_sample = 16,
+            .mclk_multiple = 0,
+        };
+        int ret = esp_codec_dev_open(s_mic_monitor_record, &fs);
+        if (ret != ESP_CODEC_DEV_OK && ret != ESP_CODEC_DEV_WRONG_STATE) {
+            ESP_LOGW(TAG_MIC, "Failed to open record device (%d)", ret);
+            return false;
+        }
+        if (ret == ESP_CODEC_DEV_OK || !s_mic_monitor_record_open) {
+            int gain_ret = esp_codec_dev_set_in_gain(s_mic_monitor_record, 40.0f);
+            if (gain_ret != ESP_CODEC_DEV_OK) {
+                ESP_LOGW(TAG_MIC, "Failed to set input gain (%d)", gain_ret);
+            }
+        }
+        s_mic_monitor_record_open = true;
+    }
+
+    return true;
+}
+
+static void mic_monitor_task(void *arg)
+{
+    int16_t sample_buffer[128];  // 128 samples = 256 bytes @16-bit
+
+    while (!s_mic_monitor_stop_requested) {
+        if (!mic_monitor_prepare_record()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        int read_ret = esp_codec_dev_read(s_mic_monitor_record, sample_buffer, sizeof(sample_buffer));
+        if (read_ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG_MIC, "esp_codec_dev_read failed (%d)", read_ret);
+            s_mic_monitor_record_open = false;
+            esp_codec_dev_close(s_mic_monitor_record);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        size_t sample_count = sizeof(sample_buffer) / sizeof(int16_t);
+
+        int16_t peak_max = -32768;
+        int16_t peak_min = 32767;
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            if (sample_buffer[i] > peak_max) {
+                peak_max = sample_buffer[i];
+            }
+            if (sample_buffer[i] < peak_min) {
+                peak_min = sample_buffer[i];
+            }
+        }
+
+        ESP_LOGI(TAG_MIC, "Samples=%u range=[%d, %d]", (unsigned)sample_count, peak_min, peak_max);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (s_mic_monitor_record && s_mic_monitor_record_open) {
+        esp_codec_dev_close(s_mic_monitor_record);
+        s_mic_monitor_record_open = false;
+    }
+
+    s_mic_monitor_started = false;
+    s_mic_monitor_task_handle = NULL;
+    s_mic_monitor_stop_requested = false;
+    ESP_LOGI(TAG_MIC, "Mic monitor task stopped");
+    vTaskDelete(NULL);
+}
+
+static void mic_monitor_start(void)
+{
+    if (s_mic_monitor_started) {
+        return;
+    }
+
+    s_mic_monitor_stop_requested = false;
+    if (xTaskCreate(mic_monitor_task, "mic_monitor", 3072, NULL, 4, &s_mic_monitor_task_handle) == pdPASS) {
+        s_mic_monitor_started = true;
+        ESP_LOGI(TAG_MIC, "Mic monitor task started (1 Hz)");
+    } else {
+        ESP_LOGW(TAG_MIC, "Failed to start mic monitor task");
+    }
+}
+
+static void mic_monitor_stop(void)
+{
+    if (!s_mic_monitor_started) {
+        return;
+    }
+
+    s_mic_monitor_stop_requested = true;
+
+    // Wait for the task to cleanly exit
+    const TickType_t wait_tick = pdMS_TO_TICKS(50);
+    for (int retry = 0; retry < 40; ++retry) {
+        if (!s_mic_monitor_started) {
+            break;
+        }
+        vTaskDelay(wait_tick);
+    }
+
+    if (s_mic_monitor_started && s_mic_monitor_task_handle) {
+        vTaskDelete(s_mic_monitor_task_handle);
+        s_mic_monitor_task_handle = NULL;
+        s_mic_monitor_started = false;
+        s_mic_monitor_stop_requested = false;
+    }
+
+    if (s_mic_monitor_record && s_mic_monitor_record_open) {
+        esp_codec_dev_close(s_mic_monitor_record);
+        s_mic_monitor_record_open = false;
+    }
+}
+
+static void auto_ring_task(void *arg)
+{
+    const TickType_t check_interval = pdMS_TO_TICKS(1000);
+    TickType_t waited = 0;
+    const TickType_t initial_delay = pdMS_TO_TICKS(AUTO_RING_INITIAL_DELAY_MS);
+
+    while (!s_auto_ring_stop && waited < initial_delay) {
+        vTaskDelay(check_interval);
+        waited += check_interval;
+    }
+
+    int attempt = 0;
+    while (!s_auto_ring_stop && attempt < AUTO_RING_MAX_ATTEMPTS) {
+        while (!s_auto_ring_stop && !webrtc_is_active()) {
+            vTaskDelay(check_interval);
+        }
+
+        if (s_auto_ring_stop || !webrtc_is_active()) {
+            break;
+        }
+
+        if (webrtc_is_peer_connected()) {
+            break;
+        }
+
+        attempt++;
+        ESP_LOGI(TAG, "🔔 Auto doorbell ring attempt #%d", attempt);
+        webrtc_trigger_ring();
+
+        TickType_t elapsed = 0;
+        const TickType_t retry_window = pdMS_TO_TICKS(AUTO_RING_RETRY_DELAY_MS);
+        while (!s_auto_ring_stop && !webrtc_is_peer_connected() && elapsed < retry_window) {
+            vTaskDelay(check_interval);
+            elapsed += check_interval;
+        }
+    }
+
+    s_auto_ring_task_handle = NULL;
+    s_auto_ring_stop = false;
+    ESP_LOGI(TAG, "Auto doorbell task finished");
+    vTaskDelete(NULL);
+}
+
+static void start_auto_ring_task(void)
+{
+    if (s_auto_ring_task_handle != NULL) {
+        return;
+    }
+    s_auto_ring_stop = false;
+    if (xTaskCreate(auto_ring_task, "auto_ring", 3072, NULL, 4, &s_auto_ring_task_handle) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to start auto doorbell task");
+        s_auto_ring_task_handle = NULL;
+    }
+}
+
+static void stop_auto_ring_task(void)
+{
+    if (s_auto_ring_task_handle == NULL) {
+        return;
+    }
+
+    s_auto_ring_stop = true;
+    const TickType_t wait_tick = pdMS_TO_TICKS(50);
+    for (int i = 0; i < 60 && s_auto_ring_task_handle != NULL; ++i) {
+        vTaskDelay(wait_tick);
+    }
+
+    if (s_auto_ring_task_handle != NULL) {
+        vTaskDelete(s_auto_ring_task_handle);
+        s_auto_ring_task_handle = NULL;
+    }
+    s_auto_ring_stop = false;
+}
 
 // 房间命令参数结构体：用于解析命令行输入的房间ID
 static struct {
@@ -39,6 +275,7 @@ static struct {
 
 // 完整房间URL缓存，格式: "https://server/join/room_id"
 static char room_url[128];
+static char s_auto_room_id[32] = "";
 
 /**
  * @brief 异步任务宏：创建新线程执行指定代码块
@@ -56,7 +293,7 @@ static char room_url[128];
     }                                   \
     media_lib_thread_create_from_scheduler(NULL, #name, run_async##name, NULL);
 
-// WebRTC信令服务器地址，默认使用官方服务器
+// WebRTC信令服务器地址，默认使用Espressif官方服务器
 char server_url[64] = "https://webrtc.espressif.com";
 
 /**
@@ -89,6 +326,7 @@ static int join_room(int argc, char **argv)
     const char *room_id = room_args.room_id->sval[0];
     snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, room_id);
     ESP_LOGI(TAG, "Start to join in room %s", room_id);
+    mic_monitor_stop();
     start_webrtc(room_url);
     return 0;
 }
@@ -239,12 +477,39 @@ static int test_cli(int argc, char **argv)
     return 0;
 }
 
+/**
+ * @brief 麦克风回音测试命令
+ * 用法: loopback [start|stop]
+ */
+static int loopback_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: loopback [start|stop]\n");
+        return 1;
+    }
+    
+    if (strcmp(argv[1], "start") == 0) {
+        printf("Starting microphone loopback test...\n");
+        printf("Speak into the microphone, you should hear your voice from speaker!\n");
+        mic_loopback_start();
+    } else if (strcmp(argv[1], "stop") == 0) {
+        printf("Stopping microphone loopback test...\n");
+        mic_loopback_stop();
+    } else {
+        printf("Unknown command: %s\n", argv[1]);
+        printf("Usage: loopback [start|stop]\n");
+        return 1;
+    }
+    
+    return 0;
+}
+
 static int init_console()
 {
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt = "esp>";
-    repl_config.task_stack_size = 10 * 1024;
+    repl_config.task_stack_size = 16 * 1024;  // 增加栈大小：10KB → 16KB
     repl_config.task_priority = 22;
     repl_config.max_cmdline_length = 1024;
     // install console REPL environment
@@ -322,6 +587,11 @@ static int init_console()
             .command = "test",
             .help = "Hardware test: test [lcd|mic|speaker|all]\r\n",
             .func = test_cli,
+        },
+        {
+            .command = "loopback",
+            .help = "Microphone loopback test: loopback [start|stop]\r\n",
+            .func = loopback_cli,
         },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -426,18 +696,66 @@ static char* gen_room_id_use_mac(void)
 static int network_event_handler(bool connected)
 {
     if (connected) {
-        // Wi-Fi连接成功，异步启动WebRTC会话
-        RUN_ASYNC(start, {
-            char *room = gen_room_id_use_mac();
-            snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, room);
-            ESP_LOGI(TAG, "Start to join in room %s", room);
-            if (start_webrtc(room_url) == 0) {
-                ESP_LOGW(TAG, "Please use browser to join in %s on %s/doorbell", room, server_url);
-            }
+        // Wi-Fi连接成功，运行麦克风诊断测试
+        printf("\n========================================\n");
+        printf("Wi-Fi connected!\n");
+        printf("Running Microphone Diagnostic...\n");
+        printf("This will test all I2S configurations.\n");
+        printf("========================================\n\n");
+        
+        // 3秒后自动运行诊断
+        RUN_ASYNC(auto_diagnostic, {
+            vTaskDelay(pdMS_TO_TICKS(3000));  // 等待3秒
+            ESP_LOGI(TAG, "🔬 Starting microphone diagnostic...");
+            mic_diagnostic_run();
+            ESP_LOGI(TAG, "✅ Diagnostic complete! Check results above.");
         });
+
+        RUN_ASYNC(auto_mic_monitor, {
+            vTaskDelay(pdMS_TO_TICKS(5000));  // 等待诊断完成后再监测
+            mic_monitor_start();
+        });
+
+        if (ENABLE_AUTO_LOOPBACK && !s_loopback_auto_started) {
+            s_loopback_auto_started = true;
+            RUN_ASYNC(auto_loopback_start, {
+                vTaskDelay(pdMS_TO_TICKS(7000));  // 诊断完成后自动开始回环
+                ESP_LOGI(TAG, "🔁 Starting microphone loopback test (auto)");
+                mic_loopback_start();
+            });
+            RUN_ASYNC(auto_loopback_stop, {
+                vTaskDelay(pdMS_TO_TICKS(13000));  // 播放一段时间后自动停止
+                ESP_LOGI(TAG, "⏹️  Stopping microphone loopback test (auto)");
+                mic_loopback_stop();
+            });
+        }
+
+        if (ENABLE_AUTO_WEBRTC_JOIN && !s_webrtc_auto_started) {
+            s_webrtc_auto_started = true;
+            RUN_ASYNC(auto_webrtc_join, {
+                vTaskDelay(pdMS_TO_TICKS(9000));
+                const char *room = gen_room_id_use_mac();
+                strncpy(s_auto_room_id, room, sizeof(s_auto_room_id) - 1);
+                s_auto_room_id[sizeof(s_auto_room_id) - 1] = '\0';
+                snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, s_auto_room_id);
+                ESP_LOGI(TAG, "🌐 Auto joining WebRTC room: %s", s_auto_room_id);
+                ESP_LOGI(TAG, "   Open https://webrtc.espressif.com/#/doorbell and enter room ID: %s", s_auto_room_id);
+                mic_monitor_stop();
+                int ret = start_webrtc(room_url);
+                if (ret != 0) {
+                    ESP_LOGE(TAG, "Auto WebRTC start failed (%d)", ret);
+                }
+            });
+        }
+        start_auto_ring_task();
     } else {
-        // Wi-Fi断开，停止WebRTC
+        // Wi-Fi断开，停止测试和WebRTC
+        mic_loopback_stop();
         stop_webrtc();
+        s_loopback_auto_started = false;
+        s_webrtc_auto_started = false;
+        stop_auto_ring_task();
+        mic_monitor_stop();
     }
     return 0;
 }
@@ -474,6 +792,12 @@ void app_main(void)
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "📟 Initializing board...");
     ESP_LOGI(TAG, "========================================");
+    
+    // init_board()会自动执行完整的4步初始化流程：
+    // 1. myiic_init()  - I2C总线（GPIO48/45）
+    // 2. xl9555_init() - IO扩展芯片
+    // 3. xl9555_pin_write(SPK_CTRL_IO, 1) - 扬声器使能
+    // 4. myi2s_init()  - I2S音频（GPIO21/13/14/47）
     init_board();
     ESP_LOGI(TAG, "✅ Board initialized");
 
@@ -485,12 +809,10 @@ void app_main(void)
     // ESP_LOGI(TAG, "✅ LCD initialized (use 'test lcd' to test)");
 #endif
 
-    // 构建媒体系统：暂时禁用USB摄像头，避免USB枚举冲突
-    // TODO: 等摄像头到货后再启用
-    ESP_LOGW(TAG, "⚠️  Media system initialization skipped (waiting for USB camera)");
-    // ESP_LOGI(TAG, "🎬 Building media system...");
-    // media_sys_buildup();
-    // ESP_LOGI(TAG, "✅ Media system ready");
+    // 构建媒体系统：启用音频系统（纯音频模式，暂无摄像头）
+    ESP_LOGI(TAG, "🎬 Building media system (audio-only mode)...");
+    media_sys_buildup();
+    ESP_LOGI(TAG, "✅ Media system ready");
 
     // 初始化舵机云台系统（不立即扫描，通过命令手动测试）
     ESP_LOGI(TAG, "🎮 Initializing servo gimbal...");
