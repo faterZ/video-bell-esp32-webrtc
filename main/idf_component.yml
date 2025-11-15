@@ -3,6 +3,9 @@ dependencies:
   ## Required IDF version
   idf:
     version: ">=5.0"
+  ## LCD drivers (simplified - following xiaozhi-ai esp-box pattern)
+  ## Note: LVGL and esp_lvgl_port are now in managed_components (manually copied)
+  ## Only keep dependencies that aren't already manually copied
   ## Import needed components only
   espressif/esp_h264:
     version: "1.0.4"
@@ -10,11 +13,11 @@ dependencies:
     - if: target in [esp32p4, esp32s3]
   ## USB camera support for ESP32-S3 (using exact versions from working example)
   espressif/usb_stream:
-    version: "1.4.0"
+    version: "^1.4.0"
     rules:
     - if: target == esp32s3
   espressif/esp_jpeg:
-    version: "^1.0.5"
+    version: "^1.0.5~2"
     rules:
     - if: target == esp32s3
   lijunru-hub/esp-ppbuffer:

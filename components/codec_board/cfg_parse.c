@@ -236,6 +236,9 @@ static lcd_controller_type_t lcd_get_controller(const char* s)
     if (str_same(s, "st7789")) {
         return LCD_CONTROLLER_TYPE_ST7789;
     }
+    if (str_same(s, "ili9341")) {
+        return LCD_CONTROLLER_TYPE_ILI9341;
+    }
     return LCD_CONTROLLER_TYPE_NONE;
 }
 
@@ -315,6 +318,13 @@ static int fill_lcd_cfg(board_cfg_attr_t *attr)
                 lcd_cfg->spi_cfg.clk = get_pin(attr->value);
             } else if (str_same(attr->attr, "mosi")) {
                 lcd_cfg->spi_cfg.mosi = get_pin(attr->value);
+            } else if (str_same(attr->attr, "pclk")) {
+                int clk = atoi(attr->value);
+                lcd_cfg->spi_cfg.pclk_clk = clk < 1000 ? clk * 1000 * 1000 : clk;
+            } else if (str_same(attr->attr, "pclk_hz")) {
+                lcd_cfg->spi_cfg.pclk_clk = atoi(attr->value);
+            } else if (str_same(attr->attr, "pclk_mhz")) {
+                lcd_cfg->spi_cfg.pclk_clk = atoi(attr->value) * 1000 * 1000;
             } else if (str_same(attr->attr, "cmd_bits")) {
                 lcd_cfg->spi_cfg.cmd_bits = (uint8_t)atoi(attr->value);
             } else if (str_same(attr->attr, "param_bits")) {

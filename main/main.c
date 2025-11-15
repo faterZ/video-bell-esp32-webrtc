@@ -15,6 +15,9 @@
 #include <nvs_flash.h>
 #include <sys/param.h>
 #include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stdarg.h>
 #include "argtable3/argtable3.h"
 #include "esp_console.h"
 #include "esp_webrtc.h"
@@ -28,14 +31,19 @@
 #include "settings.h"
 #include "common.h"
 #include "esp_capture.h"
-#include "lcd_test.h"
 #include "servo_control.h"
+#include "ppbuffer.h"
+#include "usb_stream.h"
+#include "jpeg_decoder.h"
 #include "motion_tracker.h"
-#include "mic_loopback_test.h"
-#include "mic_diagnostic.h"
 #include "codec_init.h"
-#include "esp_codec_dev.h"
 #include "esp_bit_defs.h"
+#include "xl9555.h"
+#include "led.h"
+#include "lcd.h"
+#include "freertos/event_groups.h"
+#include "esp_heap_caps.h"
+#include "nvs.h"
 
 bool webrtc_is_active(void);
 void webrtc_trigger_ring(void);
@@ -43,155 +51,102 @@ bool webrtc_is_peer_connected(void);
 bool webrtc_is_ringing(void);
 
 static const char *TAG = "Webrtc_Test";
-static const char *TAG_MIC = "MicMonitor";
-static bool s_mic_monitor_started = false;
-static esp_codec_dev_handle_t s_mic_monitor_record = NULL;
-static bool s_mic_monitor_record_open = false;
-static bool s_loopback_auto_started = false;
 static bool s_webrtc_auto_started = false;
-static TaskHandle_t s_mic_monitor_task_handle = NULL;
-static volatile bool s_mic_monitor_stop_requested = false;
 static TaskHandle_t s_auto_ring_task_handle = NULL;
 static volatile bool s_auto_ring_stop = false;
 
-#define ENABLE_AUTO_LOOPBACK 0
 #define ENABLE_AUTO_WEBRTC_JOIN 1
 
 #define AUTO_RING_INITIAL_DELAY_MS 30000
 #define AUTO_RING_RETRY_DELAY_MS   15000
 #define AUTO_RING_MAX_ATTEMPTS     5
 
-static void stop_auto_ring_task(void);
+// USB Camera variables (from 29_usb_camera example)
+#define DEMO_UVC_XFER_BUFFER_SIZE (88 * 1024)
+#define BIT0_FRAME_START (0x01 << 0)
+#define DEMO_KEY_RESOLUTION "resolution"
+static EventGroupHandle_t s_evt_handle = NULL;
+static uint8_t *jpg_frame_buf1 = NULL;
+static uint8_t *jpg_frame_buf2 = NULL;
+static uint8_t *xfer_buffer_a = NULL;
+static uint8_t *xfer_buffer_b = NULL;
+static uint8_t *frame_buffer = NULL;
+static PingPongBuffer_t *ppbuffer_handle = NULL;
+static uint16_t current_width = 0;
+static uint16_t current_height = 0;
+static bool if_ppbuffer_init = false;
+static uint16_t lcd_log_cursor = 0;
+static bool lcd_log_active = false;
+static bool s_usb_device_ready = false;
+static TaskHandle_t s_usb_wait_task = NULL;
+extern uint32_t g_back_color;
 
-static bool mic_monitor_prepare_record(void)
+static void lcd_log_reset(uint16_t bg_color)
 {
-    if (s_mic_monitor_record == NULL) {
-        s_mic_monitor_record = get_record_handle();
-        if (s_mic_monitor_record == NULL) {
-            ESP_LOGW(TAG_MIC, "Record handle not ready");
-            return false;
-        }
+    if (panel_handle == NULL) {
+        return;
     }
-
-    if (!s_mic_monitor_record_open) {
-        esp_codec_dev_sample_info_t fs = {
-            .sample_rate = 16000,
-            .channel = 1,
-            .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
-            .bits_per_sample = 16,
-            .mclk_multiple = 0,
-        };
-        int ret = esp_codec_dev_open(s_mic_monitor_record, &fs);
-        if (ret != ESP_CODEC_DEV_OK && ret != ESP_CODEC_DEV_WRONG_STATE) {
-            ESP_LOGW(TAG_MIC, "Failed to open record device (%d)", ret);
-            return false;
-        }
-        if (ret == ESP_CODEC_DEV_OK || !s_mic_monitor_record_open) {
-            int gain_ret = esp_codec_dev_set_in_gain(s_mic_monitor_record, 40.0f);
-            if (gain_ret != ESP_CODEC_DEV_OK) {
-                ESP_LOGW(TAG_MIC, "Failed to set input gain (%d)", gain_ret);
-            }
-        }
-        s_mic_monitor_record_open = true;
-    }
-
-    return true;
+    g_back_color = bg_color;
+    lcd_fill(0, 0, lcd_dev.width, lcd_dev.height, bg_color);
+    lcd_log_cursor = 0;
+    lcd_log_active = true;
 }
 
-static void mic_monitor_task(void *arg)
+static void lcd_log_line(const char *fmt, ...)
 {
-    int16_t sample_buffer[128];  // 128 samples = 256 bytes @16-bit
+    if (!lcd_log_active || panel_handle == NULL) {
+        return;
+    }
+    const uint8_t font_size = 16;
+    if (lcd_log_cursor + font_size > lcd_dev.height) {
+        lcd_fill(0, 0, lcd_dev.width, lcd_dev.height, BLACK);
+        lcd_log_cursor = 0;
+    }
 
-    while (!s_mic_monitor_stop_requested) {
-        if (!mic_monitor_prepare_record()) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+    char line[96];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
 
-        int read_ret = esp_codec_dev_read(s_mic_monitor_record, sample_buffer, sizeof(sample_buffer));
-        if (read_ret != ESP_CODEC_DEV_OK) {
-            ESP_LOGW(TAG_MIC, "esp_codec_dev_read failed (%d)", read_ret);
-            s_mic_monitor_record_open = false;
-            esp_codec_dev_close(s_mic_monitor_record);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+    lcd_show_string(4,
+                    lcd_log_cursor,
+                    lcd_dev.width - 8,
+                    font_size,
+                    font_size,
+                    line,
+                    WHITE);
+    lcd_log_cursor += font_size + 2;
+}
 
-        size_t sample_count = sizeof(sample_buffer) / sizeof(int16_t);
-
-        int16_t peak_max = -32768;
-        int16_t peak_min = 32767;
-
-        for (size_t i = 0; i < sample_count; ++i) {
-            if (sample_buffer[i] > peak_max) {
-                peak_max = sample_buffer[i];
-            }
-            if (sample_buffer[i] < peak_min) {
-                peak_min = sample_buffer[i];
-            }
-        }
-
-        ESP_LOGI(TAG_MIC, "Samples=%u range=[%d, %d]", (unsigned)sample_count, peak_min, peak_max);
-
+static void usb_wait_screen_task(void *arg)
+{
+    int seconds = 0;
+    while (!s_usb_device_ready) {
+        lcd_log_line("Waiting for camera... (%ds)", seconds++);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
-    if (s_mic_monitor_record && s_mic_monitor_record_open) {
-        esp_codec_dev_close(s_mic_monitor_record);
-        s_mic_monitor_record_open = false;
-    }
-
-    s_mic_monitor_started = false;
-    s_mic_monitor_task_handle = NULL;
-    s_mic_monitor_stop_requested = false;
-    ESP_LOGI(TAG_MIC, "Mic monitor task stopped");
+    lcd_log_line("Camera connected");
+    lcd_log_active = false;
+    s_usb_wait_task = NULL;
     vTaskDelete(NULL);
 }
 
-static void mic_monitor_start(void)
-{
-    if (s_mic_monitor_started) {
-        return;
-    }
+typedef struct {
+    uint16_t width;
+    uint16_t height;
+} camera_frame_size_t;
 
-    s_mic_monitor_stop_requested = false;
-    if (xTaskCreate(mic_monitor_task, "mic_monitor", 3072, NULL, 4, &s_mic_monitor_task_handle) == pdPASS) {
-        s_mic_monitor_started = true;
-        ESP_LOGI(TAG_MIC, "Mic monitor task started (1 Hz)");
-    } else {
-        ESP_LOGW(TAG_MIC, "Failed to start mic monitor task");
-    }
-}
+typedef struct {
+    camera_frame_size_t camera_frame_size;
+    uvc_frame_size_t *camera_frame_list;
+    size_t camera_frame_list_num;
+    size_t camera_currect_frame_index;
+} camera_resolution_info_t;
 
-static void mic_monitor_stop(void)
-{
-    if (!s_mic_monitor_started) {
-        return;
-    }
+static camera_resolution_info_t camera_resolution_info = {0};
 
-    s_mic_monitor_stop_requested = true;
-
-    // Wait for the task to cleanly exit
-    const TickType_t wait_tick = pdMS_TO_TICKS(50);
-    for (int retry = 0; retry < 40; ++retry) {
-        if (!s_mic_monitor_started) {
-            break;
-        }
-        vTaskDelay(wait_tick);
-    }
-
-    if (s_mic_monitor_started && s_mic_monitor_task_handle) {
-        vTaskDelete(s_mic_monitor_task_handle);
-        s_mic_monitor_task_handle = NULL;
-        s_mic_monitor_started = false;
-        s_mic_monitor_stop_requested = false;
-    }
-
-    if (s_mic_monitor_record && s_mic_monitor_record_open) {
-        esp_codec_dev_close(s_mic_monitor_record);
-        s_mic_monitor_record_open = false;
-    }
-}
+static void stop_auto_ring_task(void);
 
 static void auto_ring_task(void *arg)
 {
@@ -326,7 +281,6 @@ static int join_room(int argc, char **argv)
     const char *room_id = room_args.room_id->sval[0];
     snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, room_id);
     ESP_LOGI(TAG, "Start to join in room %s", room_id);
-    mic_monitor_stop();
     start_webrtc(room_url);
     return 0;
 }
@@ -446,64 +400,6 @@ static int gimbal_cli(int argc, char **argv)
     return 0;
 }
 
-static int test_cli(int argc, char **argv)
-{
-    if (argc < 2) {
-        ESP_LOGI(TAG, "Usage: test [lcd|mic|speaker|all]");
-        return -1;
-    }
-    
-    if (strcmp(argv[1], "lcd") == 0) {
-        ESP_LOGI(TAG, "🖥️  Testing LCD...");
-        lcd_test_run();
-    } else if (strcmp(argv[1], "mic") == 0) {
-        ESP_LOGI(TAG, "🎤 Testing microphone (recording 3 seconds)...");
-        ESP_LOGI(TAG, "Please speak now!");
-        // TODO: 麦克风测试需要实现录音逻辑
-        ESP_LOGW(TAG, "Microphone test not yet implemented");
-    } else if (strcmp(argv[1], "speaker") == 0) {
-        ESP_LOGI(TAG, "🔊 Testing speaker...");
-        // TODO: 喇叭测试需要实现播放逻辑
-        ESP_LOGW(TAG, "Speaker test not yet implemented");
-    } else if (strcmp(argv[1], "all") == 0) {
-        ESP_LOGI(TAG, "🧪 Running all hardware tests...");
-        lcd_test_run();
-        media_lib_thread_sleep(2000);
-        ESP_LOGW(TAG, "Audio tests not yet implemented");
-    } else {
-        ESP_LOGI(TAG, "Unknown test: %s", argv[1]);
-        return -1;
-    }
-    return 0;
-}
-
-/**
- * @brief 麦克风回音测试命令
- * 用法: loopback [start|stop]
- */
-static int loopback_cli(int argc, char **argv)
-{
-    if (argc < 2) {
-        printf("Usage: loopback [start|stop]\n");
-        return 1;
-    }
-    
-    if (strcmp(argv[1], "start") == 0) {
-        printf("Starting microphone loopback test...\n");
-        printf("Speak into the microphone, you should hear your voice from speaker!\n");
-        mic_loopback_start();
-    } else if (strcmp(argv[1], "stop") == 0) {
-        printf("Stopping microphone loopback test...\n");
-        mic_loopback_stop();
-    } else {
-        printf("Unknown command: %s\n", argv[1]);
-        printf("Usage: loopback [start|stop]\n");
-        return 1;
-    }
-    
-    return 0;
-}
-
 static int init_console()
 {
     esp_console_repl_t *repl = NULL;
@@ -583,16 +479,6 @@ static int init_console()
             .help = "Gimbal control: gimbal [scan|reset|yaw <angle>|pitch <angle>]\r\n",
             .func = gimbal_cli,
         },
-        {
-            .command = "test",
-            .help = "Hardware test: test [lcd|mic|speaker|all]\r\n",
-            .func = test_cli,
-        },
-        {
-            .command = "loopback",
-            .help = "Microphone loopback test: loopback [start|stop]\r\n",
-            .func = loopback_cli,
-        },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -601,17 +487,6 @@ static int init_console()
     return 0;
 }
 
-/**
- * @brief 线程调度配置回调函数：为不同功能的线程设置优先级、栈大小、CPU核心绑定
- * @param thread_name 线程名称（由媒体库/WebRTC模块传入）
- * @param schedule_cfg 调度配置结构体（输入默认值，函数修改后输出）
- * 
- * 关键线程配置：
- * - venc_0: 视频编码线程（优先级10，栈20KB for ESP32-S3）
- * - aenc_0: 音频编码线程（OPUS需40KB栈，优先级10，绑定核心1）
- * - AUD_SRC: 音频采集线程（优先级15，保证实时性）
- * - pc_task: PeerConnection任务（25KB栈，优先级18，核心1）
- */
 static void thread_scheduler(const char *thread_name, media_lib_thread_cfg_t *schedule_cfg)
 {
     if (strcmp(thread_name, "venc_0") == 0) {
@@ -666,6 +541,322 @@ static void capture_scheduler(const char *name, esp_capture_thread_schedule_cfg_
 }
 
 /**
+ * @brief Jpeg解码一张图片 (from USB camera example)
+ */
+static int esp_jpeg_decoder_one_picture(uint8_t *input_buf, size_t len, uint8_t *output_buf)
+{
+    const int lcd_width = lcd_dev.width ? lcd_dev.width : 320;
+    const int lcd_height = lcd_dev.height ? lcd_dev.height : 240;
+
+    esp_jpeg_image_cfg_t jpeg_cfg = {
+        .indata = (uint8_t *)input_buf,
+        .indata_size = len,
+        .outbuf = output_buf,
+        .outbuf_size = lcd_width * lcd_height * sizeof(uint16_t),
+        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+        .out_scale = JPEG_IMAGE_SCALE_0,
+        .flags = {
+            .swap_color_bytes = 0,
+        }
+    };
+
+    esp_jpeg_image_output_t outimg = {0};
+    esp_err_t ret = esp_jpeg_decode(&jpeg_cfg, &outimg);
+    if (ret == ESP_OK) {
+        ESP_LOGD(TAG, "JPEG decoded: %dx%d", outimg.width, outimg.height);
+    }
+    return ret;
+}
+
+/**
+ * @brief 自适应JPG帧缓冲器 (from USB camera example)
+ */
+static void adaptive_jpg_frame_buffer(size_t length)
+{
+    if (jpg_frame_buf1 != NULL) {
+        free(jpg_frame_buf1);
+    }
+    if (jpg_frame_buf2 != NULL) {
+        free(jpg_frame_buf2);
+    }
+    
+    jpg_frame_buf1 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    assert(jpg_frame_buf1 != NULL);
+    jpg_frame_buf2 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    assert(jpg_frame_buf2 != NULL);
+    
+    ESP_ERROR_CHECK(ppbuffer_create(ppbuffer_handle, jpg_frame_buf2, jpg_frame_buf1));
+    if_ppbuffer_init = true;
+    ESP_LOGI(TAG, "USB camera buffers allocated: %zu bytes", length);
+}
+
+/**
+ * @brief 摄像头帧回调函数 (from USB camera example)
+ */
+static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
+{
+    if (current_width != frame->width || current_height != frame->height) {
+        current_width = frame->width;
+        current_height = frame->height;
+        adaptive_jpg_frame_buffer(current_width * current_height * 2);
+    }
+
+    static void *jpeg_buffer = NULL;
+    ppbuffer_get_write_buf(ppbuffer_handle, &jpeg_buffer);
+    assert(jpeg_buffer != NULL);
+    
+    esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer);
+    ppbuffer_set_write_done(ppbuffer_handle);
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+/**
+ * @brief USB摄像头显示任务 (from USB camera example)
+ */
+static void usb_display_task(void *arg)
+{
+    uint16_t *lcd_buffer = NULL;
+    int64_t count_start_time = 0;
+    int frame_count = 0;
+    int fps = 0;
+    int x_start = 0;
+    int y_start = 0;
+
+    int wait_cycles = 0;
+    while (panel_handle == NULL) {
+        if (wait_cycles % 50 == 0) {
+            ESP_LOGW(TAG, "Waiting for LCD panel handle...");
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        ++wait_cycles;
+    }
+
+    while (!if_ppbuffer_init) {
+        vTaskDelay(1);
+    }
+
+    ESP_LOGI(TAG, "USB camera display task started");
+
+    while (1) {
+        if (ppbuffer_get_read_buf(ppbuffer_handle, (void *)&lcd_buffer) == ESP_OK) {
+            const int lcd_width = lcd_dev.width ? lcd_dev.width : current_width;
+            const int lcd_height = lcd_dev.height ? lcd_dev.height : current_height;
+
+            if (current_width <= lcd_width && current_height <= lcd_height) {
+                x_start = (lcd_width - current_width) / 2;
+                y_start = (lcd_height - current_height) / 2;
+                esp_lcd_panel_draw_bitmap(panel_handle,
+                                          x_start,
+                                          y_start,
+                                          x_start + current_width,
+                                          y_start + current_height,
+                                          lcd_buffer);
+            }
+            
+            ppbuffer_set_read_done(ppbuffer_handle);
+
+            if (count_start_time == 0) {
+                count_start_time = esp_timer_get_time();
+            }
+
+            if (++frame_count == 20) {
+                frame_count = 0;
+                fps = 20 * 1000000 / (esp_timer_get_time() - count_start_time);
+                count_start_time = esp_timer_get_time();
+                ESP_LOGI(TAG, "USB camera fps: %d (%dx%d)", fps, current_width, current_height);
+            }
+        }
+        vTaskDelay(1);
+    }
+}
+
+static void usb_get_value_from_nvs(const char *key, void *value, size_t *size)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("memory", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_get_blob(handle, key, value, size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "%s not saved yet", key);
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS read %s failed: %s", key, esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+}
+
+static esp_err_t usb_set_value_to_nvs(const char *key, const void *value, size_t size)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("memory", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_blob(handle, key, value, size);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS write %s failed: %s", key, esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static size_t usb_camera_find_current_resolution(camera_frame_size_t *camera_frame_size)
+{
+    if (camera_resolution_info.camera_frame_list == NULL) {
+        return (size_t)-1;
+    }
+
+    size_t index = (size_t)-1;
+    for (size_t i = 0; i < camera_resolution_info.camera_frame_list_num; ++i) {
+        const uvc_frame_size_t *frame = &camera_resolution_info.camera_frame_list[i];
+        if (camera_frame_size->width >= frame->width && camera_frame_size->height >= frame->height) {
+            camera_frame_size->width = frame->width;
+            camera_frame_size->height = frame->height;
+            index = i;
+            break;
+        }
+        if (i == camera_resolution_info.camera_frame_list_num - 1) {
+            camera_frame_size->width = frame->width;
+            camera_frame_size->height = frame->height;
+            index = i;
+        }
+    }
+
+    if (index != (size_t)-1) {
+        ESP_LOGI(TAG, "Current resolution is %dx%d", camera_frame_size->width, camera_frame_size->height);
+    }
+
+    return index;
+}
+
+/**
+ * @brief USB数据流状态回调 (simplified from USB camera example)
+ */
+static void usb_stream_state_changed_cb(usb_stream_state_t event, void *arg)
+{
+    lcd_log_line("USB event: %d", event);
+    switch (event) {
+        case STREAM_CONNECTED: {
+            s_usb_device_ready = true;
+            lcd_log_line("USB event: STREAM_CONNECTED");
+            size_t size = sizeof(camera_frame_size_t);
+            usb_get_value_from_nvs(DEMO_KEY_RESOLUTION, &camera_resolution_info.camera_frame_size, &size);
+            size_t frame_index = 0;
+            uvc_frame_size_list_get(NULL, &camera_resolution_info.camera_frame_list_num, NULL);
+
+            if (camera_resolution_info.camera_frame_list_num) {
+                lcd_log_line("UVC: Found %d frame sizes", camera_resolution_info.camera_frame_list_num);
+                ESP_LOGI(TAG, "UVC: get frame list size = %u, current = %u",
+                         camera_resolution_info.camera_frame_list_num, frame_index);
+                uvc_frame_size_t *_frame_list = (uvc_frame_size_t *)malloc(camera_resolution_info.camera_frame_list_num * sizeof(uvc_frame_size_t));
+
+                camera_resolution_info.camera_frame_list = (uvc_frame_size_t *)realloc(camera_resolution_info.camera_frame_list,
+                                                                                       camera_resolution_info.camera_frame_list_num * sizeof(uvc_frame_size_t));
+
+                if (camera_resolution_info.camera_frame_list == NULL) {
+                    ESP_LOGE(TAG, "camera_resolution_info.camera_frame_list realloc failed");
+                    lcd_log_line("Error: Frame list alloc failed");
+                }
+
+                uvc_frame_size_list_get(_frame_list, NULL, NULL);
+
+                for (size_t i = 0; i < camera_resolution_info.camera_frame_list_num; i++) {
+                    if (_frame_list[i].width <= lcd_dev.width && _frame_list[i].height <= lcd_dev.height) {
+                        camera_resolution_info.camera_frame_list[frame_index++] = _frame_list[i];
+                        ESP_LOGI(TAG, "\tpick frame[%u] = %ux%u", (unsigned)i, _frame_list[i].width, _frame_list[i].height);
+                    } else {
+                        ESP_LOGI(TAG, "\tdrop frame[%u] = %ux%u", (unsigned)i, _frame_list[i].width, _frame_list[i].height);
+                    }
+                }
+                camera_resolution_info.camera_frame_list_num = frame_index;
+                lcd_log_line("UVC: Picked %d frames", frame_index);
+
+                if (camera_resolution_info.camera_frame_size.width != 0 && camera_resolution_info.camera_frame_size.height != 0) {
+                    camera_resolution_info.camera_currect_frame_index = usb_camera_find_current_resolution(&camera_resolution_info.camera_frame_size);
+                } else {
+                    camera_resolution_info.camera_currect_frame_index = 0;
+                }
+
+                if (camera_resolution_info.camera_currect_frame_index == (size_t)-1) {
+                    ESP_LOGE(TAG, "find current resolution fail");
+                    lcd_log_line("Error: Resolution not found");
+                } else {
+                    lcd_log_line("UVC: Setting resolution...");
+                    ESP_ERROR_CHECK(uvc_frame_size_reset(
+                        camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width,
+                        camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height,
+                        FPS2INTERVAL(30)));
+                    camera_frame_size_t camera_frame_size = {
+                        .width = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width,
+                        .height = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height,
+                    };
+                    ESP_ERROR_CHECK(usb_set_value_to_nvs(DEMO_KEY_RESOLUTION, &camera_frame_size, sizeof(camera_frame_size_t)));
+                    lcd_log_line("UVC: Resolution set");
+                }
+
+                if (_frame_list != NULL) {
+                    free(_frame_list);
+                }
+                
+                lcd_log_line("UVC: Resuming stream...");
+                usb_streaming_control(STREAM_UVC, CTRL_RESUME, NULL);
+                xEventGroupSetBits(s_evt_handle, BIT0_FRAME_START);
+            } else {
+                ESP_LOGW(TAG, "UVC: get frame list size = %u", camera_resolution_info.camera_frame_list_num);
+                lcd_log_line("UVC: No frames found!");
+            }
+            ESP_LOGI(TAG, "Device connected");
+            break;
+        }
+        case STREAM_DISCONNECTED:
+            s_usb_device_ready = false;
+            xEventGroupClearBits(s_evt_handle, BIT0_FRAME_START);
+            lcd_log_line("USB event: STREAM_DISCONNECTED");
+            ESP_LOGI(TAG, "Device disconnected");
+            break;
+        default:
+            ESP_LOGE(TAG, "Unknown event");
+            lcd_log_line("USB event: Unknown (%d)", event);
+            break;
+    }
+}
+
+static esp_err_t usb_stream_init(void)
+{
+    uvc_config_t uvc_config = {
+        .frame_interval = FRAME_INTERVAL_FPS_30,
+        .xfer_buffer_size = DEMO_UVC_XFER_BUFFER_SIZE,
+        .xfer_buffer_a = xfer_buffer_a,
+        .xfer_buffer_b = xfer_buffer_b,
+        .frame_buffer_size = DEMO_UVC_XFER_BUFFER_SIZE,
+        .frame_buffer = frame_buffer,
+        .frame_cb = &camera_frame_cb,
+        .frame_cb_arg = NULL,
+        .frame_width = FRAME_RESOLUTION_ANY,
+        .frame_height = FRAME_RESOLUTION_ANY,
+        .flags = FLAG_UVC_SUSPEND_AFTER_START,
+    };
+
+    esp_err_t ret = uvc_streaming_config(&uvc_config);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uvc streaming config failed");
+    }
+    return ret;
+}
+
+/**
  * @brief 根据设备MAC地址生成唯一房间ID
  * @return 房间ID字符串，格式: "esp_XXYYZZ"（后3字节MAC地址）
  * 
@@ -696,66 +887,33 @@ static char* gen_room_id_use_mac(void)
 static int network_event_handler(bool connected)
 {
     if (connected) {
-        // Wi-Fi连接成功，运行麦克风诊断测试
-        printf("\n========================================\n");
-        printf("Wi-Fi connected!\n");
-        printf("Running Microphone Diagnostic...\n");
-        printf("This will test all I2S configurations.\n");
-        printf("========================================\n\n");
-        
-        // 3秒后自动运行诊断
-        RUN_ASYNC(auto_diagnostic, {
-            vTaskDelay(pdMS_TO_TICKS(3000));  // 等待3秒
-            ESP_LOGI(TAG, "🔬 Starting microphone diagnostic...");
-            mic_diagnostic_run();
-            ESP_LOGI(TAG, "✅ Diagnostic complete! Check results above.");
-        });
-
-        RUN_ASYNC(auto_mic_monitor, {
-            vTaskDelay(pdMS_TO_TICKS(5000));  // 等待诊断完成后再监测
-            mic_monitor_start();
-        });
-
-        if (ENABLE_AUTO_LOOPBACK && !s_loopback_auto_started) {
-            s_loopback_auto_started = true;
-            RUN_ASYNC(auto_loopback_start, {
-                vTaskDelay(pdMS_TO_TICKS(7000));  // 诊断完成后自动开始回环
-                ESP_LOGI(TAG, "🔁 Starting microphone loopback test (auto)");
-                mic_loopback_start();
-            });
-            RUN_ASYNC(auto_loopback_stop, {
-                vTaskDelay(pdMS_TO_TICKS(13000));  // 播放一段时间后自动停止
-                ESP_LOGI(TAG, "⏹️  Stopping microphone loopback test (auto)");
-                mic_loopback_stop();
-            });
-        }
-
+        ESP_LOGI(TAG, "Wi-Fi Connected");
         if (ENABLE_AUTO_WEBRTC_JOIN && !s_webrtc_auto_started) {
             s_webrtc_auto_started = true;
             RUN_ASYNC(auto_webrtc_join, {
                 vTaskDelay(pdMS_TO_TICKS(9000));
-                const char *room = gen_room_id_use_mac();
+                const char *room = "my_doorbell_room"; // 使用固定房间ID
                 strncpy(s_auto_room_id, room, sizeof(s_auto_room_id) - 1);
                 s_auto_room_id[sizeof(s_auto_room_id) - 1] = '\0';
                 snprintf(room_url, sizeof(room_url), "%s/join/%s", server_url, s_auto_room_id);
                 ESP_LOGI(TAG, "🌐 Auto joining WebRTC room: %s", s_auto_room_id);
                 ESP_LOGI(TAG, "   Open https://webrtc.espressif.com/#/doorbell and enter room ID: %s", s_auto_room_id);
-                mic_monitor_stop();
+                
+                ESP_LOGI(TAG, "Joining WebRTC room: %s", s_auto_room_id);
                 int ret = start_webrtc(room_url);
                 if (ret != 0) {
                     ESP_LOGE(TAG, "Auto WebRTC start failed (%d)", ret);
+                } else {
+                    ESP_LOGI(TAG, "WebRTC Connected - Video Call Active");
                 }
             });
         }
         start_auto_ring_task();
     } else {
-        // Wi-Fi断开，停止测试和WebRTC
-        mic_loopback_stop();
+        ESP_LOGI(TAG, "Wi-Fi Disconnected");
         stop_webrtc();
-        s_loopback_auto_started = false;
         s_webrtc_auto_started = false;
         stop_auto_ring_task();
-        mic_monitor_stop();
     }
     return 0;
 }
@@ -787,27 +945,102 @@ void app_main(void)
     // 例如视频编码线程分配更高优先级，确保实时性
     media_lib_thread_set_schedule_cb(thread_scheduler);
 
-    // 初始化硬件板卡：包括摄像头、按键、音频 codec、LCD等外设的初始化
-    // 具体初始化逻辑在init_board()函数中实现（如引脚配置、设备上电等）
+    // 初始化硬件板卡：摄像头、按键、音频 codec 等外设
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "📟 Initializing board...");
+    ESP_LOGI(TAG, "📟 Initializing board peripherals...");
     ESP_LOGI(TAG, "========================================");
-    
-    // init_board()会自动执行完整的4步初始化流程：
-    // 1. myiic_init()  - I2C总线（GPIO48/45）
-    // 2. xl9555_init() - IO扩展芯片
-    // 3. xl9555_pin_write(SPK_CTRL_IO, 1) - 扬声器使能
-    // 4. myi2s_init()  - I2S音频（GPIO21/13/14/47）
-    init_board();
-    ESP_LOGI(TAG, "✅ Board initialized");
 
-#ifdef CONFIG_IDF_TARGET_ESP32S3
-    // ESP32-S3: 初始化 LCD（暂时禁用，因为与codec_init的I2C冲突）
-    // TODO: 需要统一I2C管理，让LCD复用codec_init的I2C总线
-    ESP_LOGW(TAG, "⚠️  LCD initialization skipped (I2C conflict with codec_init)");
-    // lcd_test_init();
-    // ESP_LOGI(TAG, "✅ LCD initialized (use 'test lcd' to test)");
-#endif
+    led_init();
+    init_board();
+    ESP_LOGI(TAG, "✅ Board core peripherals ready");
+
+    // 使用 USB Camera 示例的 LCD 驱动进行屏幕初始化
+    ESP_LOGI(TAG, "🖥️  Initializing LCD display (USB camera reference)...");
+    lcd_cfg_t lcd_cfg = {
+        .notify_flush_ready = NULL,
+        .user_ctx = NULL,
+    };
+    lcd_init(lcd_cfg);
+    ESP_LOGI(TAG, "✅ LCD display initialized via BSP/LCD driver");
+    lcd_log_reset(BLACK);
+    lcd_log_line("LCD ready (%dx%d)", lcd_dev.width, lcd_dev.height);
+    
+    // 检查 I2C 和 IO 扩展芯片
+    lcd_log_line("Checking I2C devices...");
+    if (myiic_init() == ESP_OK) {
+        lcd_log_line("I2C master OK");
+    } else {
+        lcd_log_line("I2C master FAILED");
+    }
+    if (xl9555_init() == ESP_OK) {
+        lcd_log_line("XL9555 IO expander OK");
+        // 尝试显式启用 USB 电源
+        xl9555_pin_write(IO1_4, 1);
+        lcd_log_line("USB Power Enabled");
+    } else {
+        lcd_log_line("XL9555 IO expander FAILED");
+    }
+
+    lcd_log_line("Waiting for USB camera...");
+
+    // Initialize USB camera (following 29_usb_camera example)
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "📷 Initializing USB Camera...");
+    ESP_LOGI(TAG, "========================================");
+
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    } else {
+        ESP_ERROR_CHECK(nvs_ret);
+    }
+
+    s_evt_handle = xEventGroupCreate();
+    if (s_evt_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to create event group for USB camera");
+    } else {
+        bool alloc_ok = true;
+        xfer_buffer_a = malloc(DEMO_UVC_XFER_BUFFER_SIZE);
+        xfer_buffer_b = malloc(DEMO_UVC_XFER_BUFFER_SIZE);
+        frame_buffer = malloc(DEMO_UVC_XFER_BUFFER_SIZE);
+        ppbuffer_handle = calloc(1, sizeof(PingPongBuffer_t));
+
+        if (!xfer_buffer_a || !xfer_buffer_b || !frame_buffer || !ppbuffer_handle) {
+            ESP_LOGE(TAG, "Failed to allocate USB camera buffers");
+            alloc_ok = false;
+        }
+
+        if (!alloc_ok) {
+            free(xfer_buffer_a);
+            free(xfer_buffer_b);
+            free(frame_buffer);
+            free(ppbuffer_handle);
+            xfer_buffer_a = xfer_buffer_b = frame_buffer = NULL;
+            ppbuffer_handle = NULL;
+        } else {
+            BaseType_t task_ret = xTaskCreate(usb_display_task, "usb_display_task", 4 * 1024, NULL, 5, NULL);
+            if (task_ret != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create USB display task");
+                lcd_log_line("Error: Display task failed");
+            } else {
+                lcd_log_line("USB: Initing stream...");
+                ESP_ERROR_CHECK(usb_stream_init());
+                lcd_log_line("USB: Registering callback...");
+                ESP_ERROR_CHECK(usb_streaming_state_register(&usb_stream_state_changed_cb, NULL));
+                lcd_log_line("USB: Starting stream...");
+                ESP_ERROR_CHECK(usb_streaming_start());
+                lcd_log_line("USB stream started");
+                s_usb_device_ready = false;
+                if (s_usb_wait_task == NULL && lcd_log_active) {
+                    xTaskCreate(usb_wait_screen_task, "usb_wait_screen", 2048, NULL, 4, &s_usb_wait_task);
+                }
+                lcd_log_line("USB: Waiting for connection...");
+                ESP_ERROR_CHECK(usb_streaming_connect_wait(portMAX_DELAY));
+                ESP_LOGI(TAG, "✅ USB camera system ready");
+            }
+        }
+    }
 
     // 构建媒体系统：启用音频系统（纯音频模式，暂无摄像头）
     ESP_LOGI(TAG, "🎬 Building media system (audio-only mode)...");

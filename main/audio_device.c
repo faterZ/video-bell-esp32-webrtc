@@ -11,6 +11,8 @@
 #include "esp_codec_dev.h"
 #include "audio_codec_if.h"
 #include "audio_codec_data_if.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
@@ -218,47 +220,46 @@ static int data_set_fmt(const audio_codec_data_if_t *h, esp_codec_dev_type_t dev
 
 static int data_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
 {
-    size_t bytes_read = i2s_rx_read(data, size);
-    
-    // 🔥 详细调试:记录每次读取
+    size_t total = 0;
+    int retry = 0;
+
+    while (total < (size_t)size) {
+        size_t chunk = i2s_rx_read(data + total, size - total);
+        if (chunk == 0) {
+            if (++retry > 10) {
+                ESP_LOGW(TAG, "I2S RX timeout after retries, total=%u, need=%d", (unsigned)total, size);
+                return ESP_FAIL;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        total += chunk;
+    }
+
     static int read_debug_count = 0;
     read_debug_count++;
-    
-    // 每次都打印简要信息
-    if (read_debug_count <= 20 || (read_debug_count % 100) == 0) {
-        ESP_LOGI(TAG, "� [ESP32→Browser] data_read #%d: requested=%d, bytes_read=%u", 
-                 read_debug_count, size, bytes_read);
-    }
-    
-    //前5次打印详细数据
-    if (read_debug_count <= 10 && bytes_read > 0) {
-        int16_t *samples = (int16_t *)data;
-        int num_samples = bytes_read / 2;
-        int16_t max_val = 0, min_val = 0;
-        for (int i = 0; i < num_samples && i < 80; i++) {
-            if (samples[i] > max_val) max_val = samples[i];
-            if (samples[i] < min_val) min_val = samples[i];
-        }
-        ESP_LOGI(TAG, "   📊 MIC Data #%d: samples=%d, range=[%d, %d]",
-                 read_debug_count, num_samples, min_val, max_val);
-                 
-        // 🔥 特别警告:如果数据全0
-        if (max_val == 0 && min_val == 0) {
-            ESP_LOGW(TAG, "   ⚠️  WARNING: Microphone data is all ZERO! Hardware may not be working.");
+    if (read_debug_count <= 20 || (read_debug_count % 200) == 0) {
+        ESP_LOGI(TAG, "[MIC→WEBRTC] read #%d: %d bytes", read_debug_count, size);
+        if (read_debug_count <= 20) {
+            int16_t *samples = (int16_t *)data;
+            int num_samples = size / 2;
+            int16_t max_val = 0, min_val = 0;
+            for (int i = 0; i < num_samples && i < 80; i++) {
+                if (samples[i] > max_val) {
+                    max_val = samples[i];
+                }
+                if (samples[i] < min_val) {
+                    min_val = samples[i];
+                }
+            }
+            ESP_LOGI(TAG, "   MIC data range=[%d, %d] samples=%d", min_val, max_val, num_samples);
+            if (max_val == 0 && min_val == 0) {
+                ESP_LOGW(TAG, "   WARNING: microphone samples are all zero");
+            }
         }
     }
-    
-    // 🔥 即使数据全0,也返回读取的字节数
-    // 让 WebRTC 决定如何处理静音数据
-    if (bytes_read == 0) {
-        if (read_debug_count <= 10) {
-            ESP_LOGW(TAG, "❌ I2S RX timeout, no data read, returning ESP_FAIL");
-        }
-        return ESP_FAIL;
-    }
-    
-    // ✅ 返回实际读取的字节数(即使全0)
-    return (int)bytes_read;
+
+    return ESP_CODEC_DEV_OK;
 }
 
 static int data_write(const audio_codec_data_if_t *h, uint8_t *data, int size)

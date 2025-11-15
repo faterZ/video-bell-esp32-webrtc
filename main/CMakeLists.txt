@@ -1,6 +1,5 @@
 idf_component_register(SRCS "webrtc.c"  "main.c" "board.c" "media_sys.c" "lcd_test.c" 
                               "servo_control.c" "motion_tracker.c"
-                              "mic_loopback_test.c" "mic_diagnostic.c"
                        EMBED_TXTFILES "ring.aac" "open.aac" "join.aac"
                        INCLUDE_DIRS "."
                        REQUIRES common BSP codec_board av_render esp_peer esp_webrtc 

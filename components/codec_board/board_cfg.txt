@@ -54,6 +54,14 @@ Board: ESP32S3_BOX
 i2c: {sda: 48, scl: 45}
 i2s: {mclk: -1, bclk: 21, ws: 13, dout: 14, din: 47}
 in_out: {codec: ES8311, pa: 46, use_mclk: 0, pa_gain: 6}
+lcd: {
+    bus: spi, controller: ili9341, spi_bus: 3,
+    mirror_x: 1, mirror_y: 1, swap_xy: 0, color_inv: 0,
+    width: 320, height: 240,
+    rst: 48, cs: 5,
+    dc: 4, clk: 7, mosi: 6, pclk: 40,
+    cmd_bits: 8, param_bits: 8
+}
 
 Board: ESP32_S3_BOX_3
 i2c: {sda: 8, scl: 18, i2c_addr: 24}

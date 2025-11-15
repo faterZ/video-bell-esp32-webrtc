@@ -10,6 +10,7 @@
 #pragma once
 
 #include "esp_webrtc.h"
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +37,23 @@ int media_sys_buildup(void);
  *      - Others  Invalid argument
  */
 int media_sys_get_provider(esp_webrtc_media_provider_t *provider);
+
+/**
+ * @brief  Start local USB camera preview on LCD (ESP32-S3 only)
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_NOT_SUPPORTED if USB preview is not available
+ *      - Other error codes from USB stream driver
+ */
+esp_err_t media_sys_start_usb_preview(void);
+
+void media_sys_dump_usb_preview_events(void);
+
+/**
+ * @brief  Display an LCD splash screen indicating initialization success
+ */
+void media_sys_show_lcd_ready_message(void);
 
 /**
  * @brief  Play captured media directly

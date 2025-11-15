@@ -165,6 +165,7 @@ typedef enum {
 typedef enum {
     LCD_CONTROLLER_TYPE_NONE,   /*!< None controller type */
     LCD_CONTROLLER_TYPE_ST7789, /*!< ST7789 controller type */
+    LCD_CONTROLLER_TYPE_ILI9341, /*!< ILI9341 controller type */
 } lcd_controller_type_t;
 
 /**

@@ -18,6 +18,7 @@ typedef struct {
     tracker_config_t config;
     uint8_t *prev_frame;        // 前一帧（灰度）
     uint8_t *motion_mask;       // 运动掩码
+    uint8_t *gray_frame_buf;    // 临时灰度缓冲
     bool initialized;
     bool running;
     
@@ -74,8 +75,21 @@ esp_err_t motion_tracker_init(tracker_config_t *config)
     if (!tracker.motion_mask) {
         ESP_LOGE(TAG, "❌ Failed to allocate motion_mask buffer");
         free(tracker.prev_frame);
+        tracker.prev_frame = NULL;
         return ESP_ERR_NO_MEM;
     }
+    memset(tracker.motion_mask, 0, frame_size);
+
+    tracker.gray_frame_buf = (uint8_t*)malloc(frame_size);
+    if (!tracker.gray_frame_buf) {
+        ESP_LOGE(TAG, "❌ Failed to allocate gray_frame buffer");
+        free(tracker.motion_mask);
+        tracker.motion_mask = NULL;
+        free(tracker.prev_frame);
+        tracker.prev_frame = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    memset(tracker.gray_frame_buf, 0, frame_size);
     
     // 初始化PID控制器
     tracker.error_yaw_prev = 0;
@@ -118,19 +132,39 @@ esp_err_t motion_tracker_process_frame(uint8_t *frame, uint16_t width,
     }
     
     // 转换为灰度（如果是彩色）
+    size_t pixel_count = (size_t)width * height;
     uint8_t *gray_frame = NULL;
-    if (channels == 3) {
-        gray_frame = (uint8_t*)malloc(width * height);
-        if (!gray_frame) {
-            ESP_LOGE(TAG, "Failed to allocate gray_frame");
-            return ESP_ERR_NO_MEM;
+
+    if (channels == 1) {
+        gray_frame = frame; // 输入已是灰度
+    } else if (channels == 3) {
+        if (!tracker.gray_frame_buf) {
+            ESP_LOGE(TAG, "Tracker gray buffer unavailable");
+            return ESP_ERR_INVALID_STATE;
         }
-        
-        for (int i = 0; i < width * height; i++) {
-            gray_frame[i] = rgb_to_gray(frame[i*3], frame[i*3+1], frame[i*3+2]);
+        for (size_t i = 0, j = 0; i < pixel_count; i++, j += 3) {
+            tracker.gray_frame_buf[i] = rgb_to_gray(frame[j], frame[j + 1], frame[j + 2]);
         }
+        gray_frame = tracker.gray_frame_buf;
+    } else if (channels == 2) {
+        if (!tracker.gray_frame_buf) {
+            ESP_LOGE(TAG, "Tracker gray buffer unavailable");
+            return ESP_ERR_INVALID_STATE;
+        }
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint16_t pixel = (uint16_t)frame[i * 2] | ((uint16_t)frame[i * 2 + 1] << 8);
+            uint8_t r5 = (pixel >> 11) & 0x1F;
+            uint8_t g6 = (pixel >> 5) & 0x3F;
+            uint8_t b5 = pixel & 0x1F;
+            uint8_t r = (uint8_t)((r5 * 255 + 15) / 31);
+            uint8_t g = (uint8_t)((g6 * 255 + 31) / 63);
+            uint8_t b = (uint8_t)((b5 * 255 + 15) / 31);
+            tracker.gray_frame_buf[i] = rgb_to_gray(r, g, b);
+        }
+        gray_frame = tracker.gray_frame_buf;
     } else {
-        gray_frame = frame; // 已经是灰度
+        ESP_LOGE(TAG, "Unsupported channel count: %u", channels);
+        return ESP_ERR_INVALID_ARG;
     }
     
     // 计算帧差并检测运动
@@ -158,12 +192,7 @@ esp_err_t motion_tracker_process_frame(uint8_t *frame, uint16_t width,
     }
     
     // 更新前一帧
-    memcpy(tracker.prev_frame, gray_frame, width * height);
-    
-    // 释放临时缓冲区
-    if (channels == 3) {
-        free(gray_frame);
-    }
+    memcpy(tracker.prev_frame, gray_frame, pixel_count);
     
     // 计算运动中心
     if (motion_count > 100) { // 至少100个像素才认为是有效运动
@@ -318,6 +347,9 @@ void motion_tracker_reset(void)
     size_t frame_size = tracker.config.frame_width * tracker.config.frame_height;
     memset(tracker.prev_frame, 0, frame_size);
     memset(tracker.motion_mask, 0, frame_size);
+    if (tracker.gray_frame_buf) {
+        memset(tracker.gray_frame_buf, 0, frame_size);
+    }
     
     // 重置PID状态
     tracker.error_yaw_prev = 0;

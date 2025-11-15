@@ -51,7 +51,7 @@ esp_err_t motion_tracker_init(tracker_config_t *config);
  * @param frame 图像帧数据（RGB888或灰度）
  * @param width 图像宽度
  * @param height 图像高度
- * @param channels 通道数（1=灰度, 3=RGB）
+ * @param channels 通道数（1=灰度, 2=RGB565, 3=RGB888）
  * @param target 输出的目标信息
  * @return ESP_OK 成功
  */

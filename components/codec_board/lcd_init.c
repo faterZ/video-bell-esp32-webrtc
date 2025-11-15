@@ -6,12 +6,20 @@
 #include "driver/gpio.h"
 #include "driver/spi_common.h"
 #include "esp_idf_version.h"
+#include "esp_err.h"
+#include "sdkconfig.h"
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
 #include "esp_lcd_panel_dev.h"
 #include "esp_lcd_panel_st7789.h"
+#include "esp_lcd_panel_vendor.h"
 #else
 #include "esp_lcd_panel_vendor.h"
+#endif
+
+// ILI9341 driver header (if available)
+#if __has_include("esp_lcd_ili9341.h")
+#include "esp_lcd_ili9341.h"
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32P4
@@ -40,45 +48,49 @@ typedef struct {
 
 static extend_io_ops_t        extend_io_ops;
 static esp_lcd_panel_handle_t panel_handle = NULL;
+// 保存SPI panel IO句柄用于寄存器读取探测
+static esp_lcd_panel_io_handle_t panel_io_handle = NULL;
 
-static int tca9554_io_init(lcd_cfg_t *cfg)
+// 简单探测函数：读取常见ID/状态寄存器并打印，帮助区分ILI9341与ST7789
+static void probe_lcd_chip(void)
 {
-    return tca9554_init(cfg->io_i2c_port);
-}
-
-static int tca9554_io_set_dir(int16_t gpio, bool output)
-{
-    gpio = (1 << gpio);
-    tca9554_set_io_config(gpio, output ? TCA9554_IO_OUTPUT : TCA9554_IO_INPUT);
-    return 0;
-}
-
-static int tca9554_io_set(int16_t gpio, bool high)
-{
-    gpio = (1 << gpio);
-    return tca9554_set_output_state(gpio, high ? TCA9554_IO_HIGH : TCA9554_IO_LOW);
-}
-
-static void register_tca9554(void)
-{
-    extend_io_ops.init = tca9554_io_init;
-    extend_io_ops.set_dir = tca9554_io_set_dir;
-    extend_io_ops.set_gpio = tca9554_io_set;
-}
-
-static int init_extend_io(lcd_cfg_t *cfg)
-{
-    if (cfg->io_type == EXTENT_IO_TYPE_NONE) {
-        return 0;
+    if (panel_io_handle == NULL) {
+        ESP_LOGW(TAG, "panel_io_handle is NULL, skip lcd probe");
+        return;
     }
-    switch (cfg->io_type) {
-        case EXTENT_IO_TYPE_TCA9554:
-            register_tca9554();
-            break;
-        default:
-            return -1;
+    const char *PROBE_TAG = "LCD_PROBE";
+    uint8_t buf[8] = {0};
+    struct {
+        uint8_t cmd;
+        const char *name;
+        int len;
+    } regs[] = {
+        {0x04, "RDMODE/ID", 4},   // 部分控制器读取模式/ID信息
+        {0x09, "RD_STATUS", 4},   // 读取状态寄存器
+        {0xDA, "RD_ID1", 1},
+        {0xDB, "RD_ID2", 1},
+        {0xDC, "RD_ID3", 1},
+        {0xD3, "RD_ID (ILI9341)", 4}, // ILI9341 特有的ID读取格式
+    };
+    ESP_LOGI(PROBE_TAG, "---- LCD register probe start ----");
+    for (size_t i = 0; i < sizeof(regs)/sizeof(regs[0]); ++i) {
+        memset(buf, 0, sizeof(buf));
+        int len = regs[i].len;
+        if (esp_lcd_panel_io_rx_param(panel_io_handle, regs[i].cmd, buf, len) == ESP_OK) {
+            char line[64];
+            int pos = snprintf(line, sizeof(line), "CMD 0x%02X (%s):", regs[i].cmd, regs[i].name);
+            for (int b = 0; b < len && pos < (int)sizeof(line) - 3; ++b) {
+                pos += snprintf(line + pos, sizeof(line) - pos, " %02X", buf[b]);
+            }
+            ESP_LOGI(PROBE_TAG, "%s", line);
+        } else {
+            ESP_LOGW(PROBE_TAG, "CMD 0x%02X (%s) read failed", regs[i].cmd, regs[i].name);
+        }
     }
-    return extend_io_ops.init(cfg);
+    // 经验性判断（仅日志提示，不做强制逻辑）：
+    // 若0xD3返回类似 00 93 41 xx 则高度疑似ILI9341
+    // 若多数寄存器均为00或FF且能正常显示，有可能是ST7789兼容初始化
+    ESP_LOGI(PROBE_TAG, "---- LCD register probe end ----");
 }
 
 static int set_pin_dir(int16_t pin, bool output)
@@ -99,9 +111,10 @@ static int set_pin_dir(int16_t pin, bool output)
 static int set_pin_state(int16_t pin, bool high)
 {
     if (pin & BOARD_EXTEND_IO_START) {
+        pin &= ~BOARD_EXTEND_IO_START;
         extend_io_ops.set_gpio(pin, high);
     } else {
-        gpio_set_level(pin, true);
+        gpio_set_level(pin, high ? 1 : 0);
     }
     return 0;
 }
@@ -120,6 +133,29 @@ static int16_t get_hw_gpio(int16_t pin)
 static void sleep_ms(int ms)
 {
     vTaskDelay(ms / portTICK_PERIOD_MS);
+}
+
+// Initialize extend IO (TCA9554 or similar IO expander)
+static int init_extend_io(lcd_cfg_t *cfg)
+{
+    int ret = 0;
+    if (cfg->io_type == EXTENT_IO_TYPE_TCA9554) {
+        // Initialize TCA9554 IO expander if needed
+        // Note: tca9554_init requires i2c_port parameter
+        ret = tca9554_init(0);  // Use I2C port 0 by default
+        if (ret == ESP_OK) {
+            // Set up extend_io_ops callbacks
+            // TCA9554 uses different API, so we need wrappers
+            extend_io_ops.init = NULL;  // Already initialized
+            extend_io_ops.set_dir = NULL;  // Use tca9554_set_io_config instead
+            extend_io_ops.set_gpio = NULL;  // Use tca9554_set_output_state instead
+            ESP_LOGI(TAG, "TCA9554 IO expander initialized");
+        } else {
+            ESP_LOGW(TAG, "TCA9554 init failed, continuing without IO expander");
+            ret = 0;  // Don't fail if IO expander is not available
+        }
+    }
+    return ret;
 }
 
 static int _lcd_rest(lcd_cfg_t *cfg)
@@ -193,8 +229,7 @@ static int _init_spi_lcd(lcd_cfg_t *cfg)
         io_config.spi_mode = 3;
     }
 #endif
-    esp_lcd_panel_io_handle_t io_handle;
-    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)bus_id, &io_config, &io_handle);
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)bus_id, &io_config, &panel_io_handle);
     RETURN_ON_ERR(ret);
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = get_hw_gpio(cfg->reset_pin),
@@ -211,10 +246,22 @@ static int _init_spi_lcd(lcd_cfg_t *cfg)
         default:
             return -1;
         case LCD_CONTROLLER_TYPE_ST7789:
-            ret = esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
+            ret = esp_lcd_new_panel_st7789(panel_io_handle, &panel_config, &panel_handle);
             RETURN_ON_ERR(ret);
             ESP_LOGI(TAG, "Init driver ST7789 finished");
             break;
+        case LCD_CONTROLLER_TYPE_ILI9341: {
+#if __has_include("esp_lcd_ili9341.h")
+            panel_config.vendor_config = NULL;
+            ret = esp_lcd_new_panel_ili9341(panel_io_handle, &panel_config, &panel_handle);
+            RETURN_ON_ERR(ret);
+            ESP_LOGI(TAG, "Init driver ILI9341 finished");
+#else
+            ESP_LOGE(TAG, "ILI9341 driver not available. Please add espressif/esp_lcd_ili9341 to dependencies");
+            ret = -1;
+#endif
+            break;
+        }
     }
     return ret;
 }
@@ -339,6 +386,7 @@ static int _init_lcd(lcd_cfg_t *cfg)
     _lcd_rest(cfg);
     if (cfg->ctrl_pin >= 0) {
         set_pin_dir(cfg->ctrl_pin, true);
+        set_pin_state(cfg->ctrl_pin, true);
     }
     if (cfg->bus_type == LCD_BUS_TYPE_SPI) {
         ret = _init_spi_lcd(cfg);
@@ -359,12 +407,20 @@ static int _init_lcd(lcd_cfg_t *cfg)
             ret = esp_lcd_panel_mirror(panel_handle, cfg->mirror_x, cfg->mirror_y);
         }
         ret = esp_lcd_panel_disp_on_off(panel_handle, true);
+        // 仅在SPI路径上进行寄存器探测
+        if (cfg->bus_type == LCD_BUS_TYPE_SPI) {
+            probe_lcd_chip();
+        }
     }
     return ret;
 }
 
 int board_lcd_init(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    ESP_LOGI(TAG, "board_lcd_init bypassed on ESP32-S3; using BSP LCD driver");
+    return ESP_OK;
+#endif
     lcd_cfg_t cfg = { 0 };
     int ret = get_lcd_cfg(&cfg);
     if (ret != 0) {
